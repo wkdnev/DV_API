@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.userprefs
+*.lock.json
+# Standard .NET ignore rules
+[Bb]in/
+[Oo]bj/
