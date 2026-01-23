@@ -17,6 +17,7 @@ using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.Authorization;
+using DV.Shared.Constants;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -102,7 +103,9 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateAudience = true,
             ValidAudiences = validAudiences,
             ValidateLifetime = true,
-            ClockSkew = TimeSpan.FromMinutes(5)
+            ClockSkew = TimeSpan.FromMinutes(5),
+            RoleClaimType = "role", // Map 'role' claim to ClaimsPrincipal roles
+            NameClaimType = "unique_name"
         };
 
         // For development, allow self-signed certs
@@ -120,8 +123,11 @@ builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("RequireGlobalAdmin", policy =>
         policy.Requirements.Add(new GlobalAdminRequirement()));
+        
+    options.AddPolicy("CanUploadDocuments", policy =>
+        policy.RequireRole(Roles.AdminGroup, Roles.GlobalAdminGroup));
 });
-builder.Services.AddSingleton<IAuthorizationHandler, GlobalAdminAuthorizationHandler>();
+builder.Services.AddScoped<IAuthorizationHandler, GlobalAdminAuthorizationHandler>();
 
 // ============================================================================
 // Service Registration
@@ -138,7 +144,7 @@ builder.Services.AddScoped<DocumentUploadResultService>();
 builder.Services.AddScoped<AuditService>();
 builder.Services.AddScoped<SessionManagementService>();
 builder.Services.AddScoped<FirstUserAdminService>();
-builder.Services.AddScoped<UserProjectAccessService>();
+// builder.Services.AddScoped<UserProjectAccessService>();
 builder.Services.AddScoped<SchemaBlobMigrationService>();
 builder.Services.AddScoped<FileUploadSecurityService>();
 builder.Services.AddScoped<DatabaseMigrationService>();
@@ -222,9 +228,13 @@ app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseMiddleware<RequestResponseLoggingMiddleware>();
 
 app.UseAuthentication();
+
+// Session Tracking (Must run after Auth so User is populated)
+app.UseMiddleware<SessionTrackingMiddleware>();
+
 app.UseAuthorization();
 
-// Role enforcement
+// Role Enforcement (Enforces session validity)
 app.UseMiddleware<RoleEnforcementMiddleware>();
 
 app.MapControllers();

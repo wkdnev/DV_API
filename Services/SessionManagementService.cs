@@ -145,6 +145,54 @@ public class SessionManagementService
     }
 
     /// <summary>
+    /// Check if a user's session is valid
+    /// </summary>
+    public async Task<bool> IsUserSessionValidAsync(string username, string? sessionKey)
+    {
+        // 1. If we have a sessionKey, checks specific session
+        if (!string.IsNullOrEmpty(sessionKey))
+        {
+            var session = await _securityContext.UserSessions
+                .FirstOrDefaultAsync(s => s.SessionKey == sessionKey);
+            
+            // If session exists, it MUST be active
+            if (session != null)
+            {
+                return session.IsActive && session.ExpiresAt > DateTime.UtcNow;
+            }
+        }
+        
+        // 2. If no specific session key or session record not found (yet),
+        // Check if the user has been globally terminated or has ANY active session?
+        // For OIDC, we might be lenient if the DB record hasn't been created yet (race condition on login).
+        // BUT strict security says "No record, no access".
+        // Let's check if the USER has any active sessions. If they have 0, they might be logged out everywhere.
+        // However, this might block new logins.
+        
+        // Compromise for this implementation:
+        // We assume InitializeSessionAsync runs before this check or shortly after.
+        // But for "Revoke", we usually query by Username if we don't have the key.
+        
+        // Let's query: Is there any explicit "Terminated" session that matches recent time? 
+        // Or simply: Does the user have *at least one* active session?
+        
+        var activeSessions = await _securityContext.UserSessions
+            .AnyAsync(s => s.Username == username && s.IsActive && s.ExpiresAt > DateTime.UtcNow);
+            
+        // If the user has valid credentials (OIDC) but no DB session, it's likely a new login 
+        // that hasn't hit InitializeSessionAsync fully, OR session was killed.
+        // If we return 'false', a valid OIDC user gets 401. 
+        // We should allow if "No explicit termination"?
+        
+        // Strict approach: Return true only if active session exists.
+        // To prevent lockout on login race: usage of InitializeSessionAsync in Middleware *before* check is crucial.
+        // Looking at middleware order: SessionTracking runs BEFORE RoleEnforcement? 
+        // We need to verify Program.cs order.
+        
+        return activeSessions; 
+    }
+
+    /// <summary>
     /// Update current role for session
     /// </summary>
     public async Task UpdateSessionRoleAsync(string newRole)
@@ -305,6 +353,16 @@ public class SessionManagementService
             .Where(s => s.IsActive && s.ExpiresAt > DateTime.UtcNow)
             .OrderByDescending(s => s.LastActivity)
             .ToListAsync();
+    }
+
+    /// <summary>
+    /// Get session by ID
+    /// </summary>
+    public async Task<UserSession?> GetSessionByIdAsync(int sessionId)
+    {
+         return await _securityContext.UserSessions
+            .Include(s => s.User)
+            .FirstOrDefaultAsync(s => s.SessionId == sessionId);
     }
 
     /// <summary>

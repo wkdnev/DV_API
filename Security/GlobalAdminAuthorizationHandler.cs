@@ -2,6 +2,8 @@
 using Microsoft.AspNetCore.Authorization;
 using DV.API.Services;
 
+using DV.Shared.Constants;
+
 namespace DV.API.Security;
 
 /// <summary>
@@ -9,36 +11,19 @@ namespace DV.API.Security;
 /// </summary>
 public class GlobalAdminAuthorizationHandler : AuthorizationHandler<GlobalAdminRequirement>
 {
-    private readonly UserService _userService;
-    private readonly IHttpContextAccessor _httpContextAccessor;
-
-    public GlobalAdminAuthorizationHandler(
-        UserService userService,
-        IHttpContextAccessor httpContextAccessor)
-    {
-        _userService = userService;
-        _httpContextAccessor = httpContextAccessor;
-    }
-
-    protected override async Task HandleRequirementAsync(
+    protected override Task HandleRequirementAsync(
         AuthorizationHandlerContext context, 
         GlobalAdminRequirement requirement)
     {
-        // Get the username from the HttpContext
-        var username = _httpContextAccessor.HttpContext?.User?.Identity?.Name;
-        
-        if (string.IsNullOrEmpty(username))
-        {
-            return; // Not authenticated
-        }
-
-        // Check if the user is a global admin
-        var isGlobalAdmin = await _userService.IsGlobalAdminAsync(username);
-        
-        if (isGlobalAdmin)
+        // Check for Global Admin claim
+        // We accept "GlobalAdmin" role or "DocViewer_GlobalAdmins" group/role
+        if (context.User.IsInRole(Roles.GlobalAdmin) || 
+            context.User.IsInRole(Roles.GlobalAdminGroup))
         {
             context.Succeed(requirement);
         }
+        
+        return Task.CompletedTask;
     }
 }
 

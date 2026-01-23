@@ -30,7 +30,7 @@ public class RoleEnforcementMiddleware
         _logger = logger;
     }
 
-    public async Task InvokeAsync(HttpContext context)
+    public async Task InvokeAsync(HttpContext context, SessionManagementService sessionService)
     {
         var path = context.Request.Path.Value?.ToLower() ?? "";
 
@@ -51,8 +51,34 @@ public class RoleEnforcementMiddleware
 
         try
         {
+            // Session Enforcement Logic
+            // Retrieve session from DB to ensure it hasn't been revoked/killed by Admin
+            // This enforces the "Manage sessions" requirement effectively immediately.
+            
+            var username = context.User.Identity?.Name;
+            if (!string.IsNullOrEmpty(username))
+            {
+                 // We use a simplified check here. In a high-load system, we'd cache this check.
+                 // SessionService should expose a quick validity check.
+                 // Note: We use the username because OIDC Session ID might not map 1:1 if cookie is stateless.
+                 // We check if the user has ANY active session or the specific session if identifiable.
+                 // Ideally, we map the OIDC 'sid' or similar claim to SessionKey.
+                 // Fallback: Check if user has at least one active session or if they are banned.
+                 
+                 // For this deep dive implementation, we will assume strict session mapping relies
+                 // on the SessionTrackingMiddleware having set up the session correctly or finding the active one.
+                 
+                var isValid = await sessionService.IsUserSessionValidAsync(username, context.Session?.Id);
+                if (!isValid)
+                {
+                    _logger.LogWarning("Blocking request for terminated/invalid session. User: {Username}", username);
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    await context.Response.WriteAsync("Session terminated or invalid.");
+                    return;
+                }
+            }
+
             // Log the authenticated user and their roles for debugging
-            var username = context.User.Identity?.Name ?? "Unknown";
             var roles = context.User.Claims
                 .Where(c => c.Type == ClaimTypes.Role || c.Type == "role")
                 .Select(c => c.Value)

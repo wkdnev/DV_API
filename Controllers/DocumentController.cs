@@ -42,7 +42,6 @@ public class DocumentController : ControllerBase
 {
     private readonly DocumentRepository _repo; // Repository for database operations
     private readonly UserService _userService; // Service for user operations
-    private readonly UserProjectAccessService _userProjectAccessService; // Service for project access validation
     private readonly AuditService _auditService; // Service for audit logging
 
     // ========================================================================
@@ -52,17 +51,14 @@ public class DocumentController : ControllerBase
     // Parameters:
     // - repo: An instance of DocumentRepository for database interactions.
     // - userService: Service for user-related operations.
-    // - userProjectAccessService: Service for validating project access.
     // - auditService: Service for audit logging.
     public DocumentController(
         DocumentRepository repo, 
         UserService userService, 
-        UserProjectAccessService userProjectAccessService,
         AuditService auditService)
     {
         _repo = repo;
         _userService = userService;
-        _userProjectAccessService = userProjectAccessService;
         _auditService = auditService;
     }
 
@@ -85,13 +81,6 @@ public class DocumentController : ControllerBase
                 return (false, null, "User not authenticated");
             }
 
-            // Get user from database
-            var currentUser = await _userService.GetUserByUsernameAsync(username);
-            if (currentUser == null)
-            {
-                return (false, null, "User not found in system");
-            }
-
             // Get document to check project access
             var document = await _repo.GetDocumentAsync(database, documentId);
             if (document == null)
@@ -99,22 +88,20 @@ public class DocumentController : ControllerBase
                 return (false, null, "Document not found");
             }
 
-            // Check if user is global admin (admins bypass project access checks)
-            var userRoles = await _userService.GetUserRolesAsync(currentUser.UserId);
-            var isGlobalAdmin = userRoles.Any(r => r.Name == "Admin");
-
-            if (isGlobalAdmin)
+            // Check if Global Admin (Bypass project check)
+            if (User.IsInRole("DV_Global_Admins") || User.HasClaim(c => (c.Type == "groups" || c.Type == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups") && c.Value == "DV_Global_Admins"))
             {
-                return (true, document, null); // Admins have access to all documents
+                return (true, document, null);
             }
 
             // For non-admin users, validate project access
             if (!document.ProjectId.HasValue)
             {
-                return (false, document, "Document is not associated with a project");
+                // If no project assigned, maybe only generic access? Assuming no access for now unless Admin.
+                 return (false, document, "Document is not associated with a project");
             }
             
-            var hasAccess = await _userProjectAccessService.UserHasProjectAccessAsync(currentUser.UserId, document.ProjectId.Value);
+            var hasAccess = await _repo.HasProjectAccessAsync(User, document.ProjectId.Value);
             if (!hasAccess)
             {
                 return (false, document, "You do not have permission to access documents from this project");
@@ -128,26 +115,74 @@ public class DocumentController : ControllerBase
         }
     }
 
-    // ========================================================================
-    // Endpoint: GetPdf
-    // ========================================================================
-    // Purpose: Retrieves a PDF document from the file system and serves it to 
-    // the client. Validates user has access to the document's project.
-    // Route: GET /api/pdf/{database}/{documentId:int}
-    // Parameters:
-    // - database: The name of the database to query.
+    private async Task<(bool isValid, Document? document, string? errorMessage)> ValidateProjectAccessAsync(string database, string schema, int documentId)
+    {
+        try
+        {
+             // Get current user from claims
+            var username = User.Identity?.Name;
+            if (string.IsNullOrEmpty(username))
+            {
+                return (false, null, "User not authenticated");
+            }
+
+            // Get document to check project access - USING SCHEMA
+            var document = await _repo.GetDocumentAsync(database, schema, documentId);
+            if (document == null)
+            {
+                return (false, null, "Document not found");
+            }
+
+            // Check if Global Admin (Bypass project check)
+            if (User.IsInRole("DV_Global_Admins") || User.HasClaim(c => (c.Type == "groups" || c.Type == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups") && c.Value == "DV_Global_Admins"))
+            {
+                return (true, document, null);
+            }
+
+            // For non-admin users, validate project access
+            if (!document.ProjectId.HasValue)
+            {
+                return (false, document, "Document is not associated with a project");
+            }
+
+            var hasAccess = await _repo.HasProjectAccessAsync(User, document.ProjectId.Value);
+            if (!hasAccess)
+            {
+                 return (false, document, "You do not have permission to access documents from this project");
+            }
+
+            return (true, document, null); // User has valid access
+        }
+        catch (Exception ex)
+        {
+             return (false, null, $"Error validating access: {ex.Message}");
+        }
+    }
+
     // - documentId: The ID of the document to retrieve.
     // Returns: IActionResult containing the PDF file or an error message.
-    [HttpGet("pdf/{database}/{documentId:int}")]
-    public async Task<IActionResult> GetPdf(string database, int documentId)
+    [HttpGet("pdf/{documentId:int}")]
+    [HttpGet("pdf-view/{documentId:int}")]
+    [HttpGet("pdf/{schema}/{documentId:int}")]
+    [HttpGet("pdf-view/{schema}/{documentId:int}")]
+    public async Task<IActionResult> GetPdf(int documentId, string? schema = null)
     {
+        // Default "database" value for internal calls if needed, though most signatures will just ignore it now.
+        const string database = "DefaultConnection";
+
         var username = User.Identity?.Name ?? "Unknown";
         ApplicationUser? currentUser = null;
         
         try
         {
             // Validate user has access to this document's project
-            var (isValid, document, errorMessage) = await ValidateProjectAccessAsync(database, documentId);
+            var validationResult = !string.IsNullOrEmpty(schema) 
+                ? await ValidateProjectAccessAsync(database, schema, documentId)
+                : await ValidateProjectAccessAsync(database, documentId);
+                
+            var isValid = validationResult.isValid;
+            var document = validationResult.document;
+            var errorMessage = validationResult.errorMessage;
             
             // Get current user for audit logging
             if (!string.IsNullOrEmpty(username))
@@ -234,16 +269,25 @@ public class DocumentController : ControllerBase
     // - documentId: The ID of the document to retrieve.
     // - pageNumber: The page number of the TIFF document to retrieve.
     // Returns: IActionResult containing the TIFF file or an error message.
-    [HttpGet("tiff/{database}/{documentId:int}/{pageNumber:int}")]
-    public async Task<IActionResult> GetTiffPage(string database, int documentId, int pageNumber)
+    [HttpGet("tiff/{documentId:int}/{pageNumber:int}")]
+    [HttpGet("tiff/{schema}/{documentId:int}/{pageNumber:int}")]
+    public async Task<IActionResult> GetTiffPage(int documentId, int pageNumber, string? schema = null)
     {
+        const string database = "DefaultConnection";
         var username = User.Identity?.Name ?? "Unknown";
         ApplicationUser? currentUser = null;
         
         try
         {
             // Validate user has access to this document's project
-            var (isValid, document, errorMessage) = await ValidateProjectAccessAsync(database, documentId);
+            var validationResult = !string.IsNullOrEmpty(schema) 
+                ? await ValidateProjectAccessAsync(database, schema, documentId)
+                : await ValidateProjectAccessAsync(database, documentId);
+                
+            var isValid = validationResult.isValid;
+            var document = validationResult.document;
+            var errorMessage = validationResult.errorMessage;
+
             
             // Get current user for audit logging
             if (!string.IsNullOrEmpty(username))
@@ -268,7 +312,9 @@ public class DocumentController : ControllerBase
                 return Forbid(errorMessage ?? "Access denied");
             }
 
-            var pages = (await _repo.GetPagesAsync(database, documentId)).ToList();
+            var pages = !string.IsNullOrEmpty(schema)
+                ? (await _repo.GetPagesAsync(database, schema, documentId)).ToList()
+                : (await _repo.GetPagesAsync(database, documentId)).ToList();
 
             if (pages == null || !pages.Any())
             {
@@ -348,16 +394,25 @@ public class DocumentController : ControllerBase
     // - documentId: The ID of the document to retrieve.
     // - pageNumber: The page number of the TIFF document to convert and retrieve.
     // Returns: IActionResult containing the JPEG file or an error message.
-    [HttpGet("tiff-view/{database}/{documentId:int}/{pageNumber:int}")]
-    public async Task<IActionResult> ViewTiffPage(string database, int documentId, int pageNumber)
+    [HttpGet("tiff-view/{documentId:int}/{pageNumber:int}")]
+    [HttpGet("tiff-view/{schema}/{documentId:int}/{pageNumber:int}")]
+    public async Task<IActionResult> ViewTiffPage(int documentId, int pageNumber, string? schema = null)
     {
+        const string database = "DefaultConnection";
         var username = User.Identity?.Name ?? "Unknown";
         ApplicationUser? currentUser = null;
         
         try
         {
             // Validate user has access to this document's project
-            var (isValid, document, errorMessage) = await ValidateProjectAccessAsync(database, documentId);
+            var validationResult = !string.IsNullOrEmpty(schema) 
+                ? await ValidateProjectAccessAsync(database, schema, documentId)
+                : await ValidateProjectAccessAsync(database, documentId);
+                
+            var isValid = validationResult.isValid;
+            var document = validationResult.document;
+            var errorMessage = validationResult.errorMessage;
+
             
             // Get current user for audit logging
             if (!string.IsNullOrEmpty(username))
@@ -382,7 +437,9 @@ public class DocumentController : ControllerBase
                 return Forbid(errorMessage ?? "Access denied");
             }
 
-            var pages = (await _repo.GetPagesAsync(database, documentId)).ToList();
+            var pages = !string.IsNullOrEmpty(schema)
+                ? (await _repo.GetPagesAsync(database, schema, documentId)).ToList()
+                : (await _repo.GetPagesAsync(database, documentId)).ToList();
 
             if (pages == null || !pages.Any())
             {

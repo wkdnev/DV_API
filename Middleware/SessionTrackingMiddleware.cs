@@ -16,7 +16,7 @@ public class SessionTrackingMiddleware
         _logger = logger;
     }
 
-    public async Task InvokeAsync(HttpContext context, SessionManagementService sessionService)
+    public async Task InvokeAsync(HttpContext context, SessionManagementService sessionService, UserService userService)
     {
         try
         {
@@ -26,15 +26,21 @@ public class SessionTrackingMiddleware
                 var username = context.User.Identity.Name;
                 if (!string.IsNullOrEmpty(username))
                 {
-                    // Update session activity for page requests (not API calls or static files)
+                    // Track ALL authenticated activity, including API calls
+                    // This is critical for session management dashboard
                     if (context.Request.Path.HasValue && 
-                        !context.Request.Path.Value.StartsWith("/api/") &&
                         !context.Request.Path.Value.StartsWith("/_blazor") &&
                         !context.Request.Path.Value.StartsWith("/_content") &&
-                        !context.Request.Path.Value.Contains("."))
+                        !context.Request.Path.Value.Contains(".")) // Skip static files
                     {
+                        // Ensure session exists (lazy loading)
+                        // Because OIDC doesn't guarantee a session record exists in our DB until we create it
+                        // We do this check/create logic here lightly, or rely on InitialiseSessionAsync having logic.
+                        
+                        await sessionService.InitializeSessionAsync(username, null, null);
+
                         await sessionService.UpdateSessionActivityAsync(
-                            "PageView", 
+                            "Activity", 
                             context.Request.Method,
                             context.Request.Path.Value);
                     }

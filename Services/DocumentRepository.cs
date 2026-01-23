@@ -53,6 +53,46 @@ public class DocumentRepository
     }
 
     // ========================================================================
+    // Method: HasProjectAccessAsync
+    // ========================================================================
+    // Purpose: Checks if a User has access to a specific Project via AD Groups.
+    // Parameters:
+    // - user: The ClaimsPrincipal containing user's identity and groups.
+    // - projectId: The ID of the project to check.
+    // Returns: boolean indicating access.
+    public async Task<bool> HasProjectAccessAsync(System.Security.Claims.ClaimsPrincipal user, int projectId)
+    {
+        // 1. Get the project
+        var project = await GetProjectAsync("DefaultConnection", projectId);
+        if (project == null) 
+        {
+            return false;
+        }
+
+        // 2. Extract Groups from Claims
+        var userGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var claim in user.Claims)
+        {
+            if (claim.Type == "groups" || 
+                claim.Type == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups" ||
+                claim.Type == "http://schemas.xmlsoap.org/claims/Group" || 
+                claim.Type == System.Security.Claims.ClaimTypes.GroupSid ||
+                claim.Type == System.Security.Claims.ClaimTypes.Role ||
+                claim.Type == "role") 
+            {
+                userGroups.Add(claim.Value);
+            }
+        }
+
+        // 3. Check Permissions
+        bool canRead = !string.IsNullOrEmpty(project.ReadPrincipal) && userGroups.Contains(project.ReadPrincipal);
+        bool canEdit = !string.IsNullOrEmpty(project.EditPrincipal) && userGroups.Contains(project.EditPrincipal);
+        
+        return canRead || canEdit;
+    }
+
+    // ========================================================================
     // Method: GetProjectsAsync (Overload)
     // ========================================================================
     // Purpose: Retrieves all projects from the database.
@@ -274,6 +314,23 @@ public class DocumentRepository
         }
 
         return new List<DocumentPage>();
+    }
+
+    // ========================================================================
+    // Method: GetPagesAsync (Overload with Schema)
+    // ========================================================================
+    // Purpose: Retrieves all pages for a specific document from a specific schema.
+    public async Task<IEnumerable<DocumentPage>> GetPagesAsync(string database, string schemaName, int documentId)
+    {
+        try
+        {
+            var sql = $"SELECT * FROM [{schemaName}].[DocumentPage] WHERE DocumentId = {{0}} ORDER BY PageNumber";
+            return await _context.Database.SqlQueryRaw<DocumentPage>(sql, documentId).ToListAsync();
+        }
+        catch
+        {
+            return new List<DocumentPage>();
+        }
     }
 
     // ========================================================================

@@ -12,20 +12,20 @@ namespace DV.API.Controllers;
 public class SecurityTestController : ControllerBase
 {
     private readonly UserService _userService;
-    private readonly UserProjectAccessService _userProjectAccessService;
+    // private readonly UserProjectAccessService _userProjectAccessService;
     private readonly DocumentRepository _documentRepository;
     private readonly ICacheService _cache;
     private readonly ILogger<SecurityTestController> _logger;
 
     public SecurityTestController(
         UserService userService,
-        UserProjectAccessService userProjectAccessService,
+        // UserProjectAccessService userProjectAccessService,
         DocumentRepository documentRepository,
         ICacheService cache,
         ILogger<SecurityTestController> logger)
     {
         _userService = userService;
-        _userProjectAccessService = userProjectAccessService;
+        // _userProjectAccessService = userProjectAccessService;
         _documentRepository = documentRepository;
         _cache = cache;
         _logger = logger;
@@ -64,10 +64,12 @@ public class SecurityTestController : ControllerBase
             var isGlobalAdmin = userRoles.Any(r => r.Name == "Admin");
 
             // Check project access
-            var hasAccess = isGlobalAdmin || (document.ProjectId.HasValue && await _userProjectAccessService.UserHasProjectAccessAsync(currentUser.UserId, document.ProjectId.Value));
+            // var hasAccess = isGlobalAdmin || (document.ProjectId.HasValue && await _userProjectAccessService.UserHasProjectAccessAsync(currentUser.UserId, document.ProjectId.Value));
+            var hasAccess = isGlobalAdmin;
 
             // Get accessible projects for user
-            var accessibleProjects = await _userProjectAccessService.GetUserAccessibleProjectsAsync(currentUser.UserId);
+            // var accessibleProjects = await _userProjectAccessService.GetUserAccessibleProjectsAsync(currentUser.UserId);
+            var accessibleProjects = new List<dynamic>();
 
             return Ok(new
             {
@@ -123,7 +125,8 @@ public class SecurityTestController : ControllerBase
 
             foreach (var project in allProjects)
             {
-                var hasAccess = isGlobalAdmin || await _userProjectAccessService.UserHasProjectAccessAsync(currentUser.UserId, project.ProjectId);
+                // var hasAccess = isGlobalAdmin || await _userProjectAccessService.UserHasProjectAccessAsync(currentUser.UserId, project.ProjectId);
+                var hasAccess = isGlobalAdmin;
                 
                 projectAccessResults.Add(new
                 {

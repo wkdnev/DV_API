@@ -1,4 +1,5 @@
 ﻿using DV.API.Data;
+using DV.Shared.Constants;
 // ============================================================================
 // RoleBasedAuthorizationAttribute.cs - Role-Based Authorization Attribute
 // ============================================================================
@@ -73,24 +74,15 @@ public class RoleBasedAuthorizationRequirement : IAuthorizationRequirement
 // ============================================================================
 public class RoleBasedAuthorizationHandler : AuthorizationHandler<RoleBasedAuthorizationRequirement>
 {
-    private readonly Services.RoleContextService _roleContext;
-    private readonly Services.UserService _userService;
     private readonly ILogger<RoleBasedAuthorizationHandler> _logger;
-    private readonly IServiceProvider _serviceProvider;
 
     public RoleBasedAuthorizationHandler(
-        Services.RoleContextService roleContext, 
-        Services.UserService userService, 
-        ILogger<RoleBasedAuthorizationHandler> logger,
-        IServiceProvider serviceProvider)
+        ILogger<RoleBasedAuthorizationHandler> logger)
     {
-        _roleContext = roleContext;
-        _userService = userService;
         _logger = logger;
-        _serviceProvider = serviceProvider;
     }
 
-    protected override async Task HandleRequirementAsync(
+    protected override Task HandleRequirementAsync(
         AuthorizationHandlerContext context, 
         RoleBasedAuthorizationRequirement requirement)
     {
@@ -99,148 +91,70 @@ public class RoleBasedAuthorizationHandler : AuthorizationHandler<RoleBasedAutho
         {
             _logger.LogInformation("User is not authenticated");
             context.Fail();
-            return;
+            return Task.CompletedTask;
         }
 
         var username = context.User.Identity!.Name;
-        if (string.IsNullOrEmpty(username))
-        {
-            _logger.LogWarning("Username is null or empty");
-            context.Fail();
-            return;
-        }
 
-        _logger.LogInformation("HandleRequirementAsync: Requirement has {Count} required roles: [{Roles}]", 
-            requirement.RequiredRoles?.Length ?? 0, 
-            requirement.RequiredRoles != null ? string.Join(", ", requirement.RequiredRoles) : "(null)");
-        
-        _logger.LogInformation("Checking role-based access for user '{Username}' with required roles: {RequiredRoles}",
+        _logger.LogInformation("Checking AD Group access for user '{Username}' with required roles: {RequiredRoles}",
             username, string.Join(", ", requirement.RequiredRoles ?? new string[0]));
 
         try
         {
-            // Check if role context is already initialized (from Razor component scope)
-            string? currentRoleName = _roleContext.CurrentRole?.Name;
-            
-            // If role context not initialized, check session directly
-            if (_roleContext.CurrentRole == null && _roleContext.UserRoles.Count == 0)
+            bool allRolesMet = true;
+            bool anyRoleMet = false;
+
+            foreach (var role in requirement.RequiredRoles ?? Array.Empty<string>())
             {
-                _logger.LogInformation("Role context not initialized, checking database for user '{Username}'", username);
+                // Map internal role names to AD Group names
+                string groupName = role;
+                if (role == Roles.Admin) groupName = Roles.AdminGroup;
+                else if (role == Roles.GlobalAdmin) groupName = Roles.GlobalAdminGroup;
+                else if (role == Roles.Auditor) groupName = Roles.AuditorGroup;
+                else if (role == Roles.Security) groupName = Roles.SecurityGroup;
+
+                bool hasGroup = context.User.IsInRole(groupName);
                 
-                // Query database directly for the user's most recent active session
-                // We can't use HttpContext.Session here because it's not available in authorization handlers
-                using var scope = _serviceProvider.CreateScope();
-                var securityContext = scope.ServiceProvider.GetRequiredService<SecurityDbContext>();
-                
-                // First, let's see how many sessions exist for this user
-                var allUserSessions = await securityContext.UserSessions
-                    .Where(s => s.Username == username)
-                    .OrderByDescending(s => s.LastActivity)
-                    .ToListAsync();
-                
-                _logger.LogInformation("Found {Count} total sessions for user '{Username}'", allUserSessions.Count, username);
-                
-                foreach (var session in allUserSessions.Take(3))
+                if (!hasGroup)
                 {
-                    _logger.LogInformation("Session: Key={Key}, IsActive={IsActive}, CurrentRole={Role}, LastActivity={LastActivity}", 
-                        session.SessionKey, session.IsActive, session.CurrentRole ?? "(null)", session.LastActivity);
+                    allRolesMet = false;
                 }
-                
-                // Get the most recent active session for this user
-                var activeSession = await securityContext.UserSessions
-                    .Where(s => s.Username == username && s.IsActive)
-                    .OrderByDescending(s => s.LastActivity)
-                    .FirstOrDefaultAsync();
-                
-                _logger.LogInformation("Active session found in database: {Found}, Role: {Role}", 
-                    activeSession != null, activeSession?.CurrentRole ?? "(null)");
-                
-                if (activeSession != null && !string.IsNullOrEmpty(activeSession.CurrentRole))
+                else
                 {
-                    currentRoleName = activeSession.CurrentRole;
-                    _logger.LogInformation("Found role '{Role}' in database session for user '{Username}'", currentRoleName, username);
+                    anyRoleMet = true;
                 }
-                
-                // If no role found in session either, user needs to select a role
-                if (string.IsNullOrEmpty(currentRoleName))
-                {
-                    _logger.LogWarning("No role found in context or database session for user '{Username}' - user must navigate through role selector first", username);
-                    context.Fail();
-                    return;
-                }
-            }
-            
-            // If we have roles in context but no current role, handle that
-            if (string.IsNullOrEmpty(currentRoleName) && _roleContext.UserRoles.Count > 0)
-            {
-                // For multi-role users, this is expected - they need to select a role first
-                if (_roleContext.UserRoles.Count > 1)
-                {
-                    _logger.LogInformation("User '{Username}' has {RoleCount} roles but no current role selected - needs to choose via role selector", username, _roleContext.UserRoles.Count);
-                    context.Fail(); // This will redirect them to role selection
-                    return;
-                }
-                // For single-role users, try to set their only role
-                else if (_roleContext.UserRoles.Count == 1)
-                {
-                    var onlyRole = _roleContext.UserRoles.First();
-                    await _roleContext.SetActiveRoleAsync(onlyRole.Name);
-                    currentRoleName = onlyRole.Name;
-                    _logger.LogInformation("Auto-set current role to '{RoleName}' for single-role user '{Username}'", currentRoleName, username);
-                }
-            }
-            
-            // Final check - we should have a role name by now
-            if (string.IsNullOrEmpty(currentRoleName))
-            {
-                _logger.LogWarning("User '{Username}' has no current role set", username);
-                context.Fail();
-                return;
             }
 
-            _logger.LogInformation("User '{Username}' current role: '{CurrentRole}'", username, currentRoleName);
-
-        // Check role requirements
-        if (requirement.RequireAllRoles)
-        {
-            // User's current role must be one of the required roles (simplified check)
-            var currentRoleMatches = requirement.RequiredRoles!.Any(role =>
-                currentRoleName.Equals(role, StringComparison.OrdinalIgnoreCase));
-            
-            if (currentRoleMatches)
+            if (requirement.RequireAllRoles)
             {
-                _logger.LogInformation("User '{Username}' current role '{CurrentRole}' matches required role(s)", username, currentRoleName);
-                context.Succeed(requirement);
-            }
-            else
-            {
-                _logger.LogWarning("User '{Username}' current role '{CurrentRole}' does not match any required roles: {RequiredRoles}",
-                    username, currentRoleName, string.Join(", ", requirement.RequiredRoles!));
-                context.Fail();
-            }
-        }
-        else
-        {
-            // User's current active role must be one of the required roles
-            var currentRoleMatches = requirement.RequiredRoles!.Any(role => 
-                currentRoleName.Equals(role, StringComparison.OrdinalIgnoreCase));                if (currentRoleMatches)
+                if (allRolesMet)
                 {
-                    _logger.LogInformation("User '{Username}' current role '{CurrentRole}' matches required role(s)", username, currentRoleName);
                     context.Succeed(requirement);
                 }
                 else
                 {
-                    _logger.LogWarning("User '{Username}' current role '{CurrentRole}' does not match any required roles: {RequiredRoles}",
-                        username, currentRoleName, string.Join(", ", requirement.RequiredRoles!));
+                    context.Fail();
+                }
+            }
+            else
+            {
+                if (anyRoleMet)
+                {
+                    context.Succeed(requirement);
+                }
+                else
+                {
                     context.Fail();
                 }
             }
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error checking role-based authorization for user '{Username}'", username);
+            _logger.LogError(ex, "Error checking AD Group authorization for user '{Username}'", username);
             context.Fail();
         }
+
+        return Task.CompletedTask;
     }
 }
 
