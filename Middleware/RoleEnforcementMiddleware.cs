@@ -58,17 +58,7 @@ public class RoleEnforcementMiddleware
             var username = context.User.Identity?.Name;
             if (!string.IsNullOrEmpty(username))
             {
-                 // We use a simplified check here. In a high-load system, we'd cache this check.
-                 // SessionService should expose a quick validity check.
-                 // Note: We use the username because OIDC Session ID might not map 1:1 if cookie is stateless.
-                 // We check if the user has ANY active session or the specific session if identifiable.
-                 // Ideally, we map the OIDC 'sid' or similar claim to SessionKey.
-                 // Fallback: Check if user has at least one active session or if they are banned.
-                 
-                 // For this deep dive implementation, we will assume strict session mapping relies
-                 // on the SessionTrackingMiddleware having set up the session correctly or finding the active one.
-                 
-                var isValid = await sessionService.IsUserSessionValidAsync(username, context.Session?.Id);
+                var isValid = await sessionService.IsSessionValidAsync(context.Session?.Id);
                 if (!isValid)
                 {
                     _logger.LogWarning("Blocking request for terminated/invalid session. User: {Username}", username);

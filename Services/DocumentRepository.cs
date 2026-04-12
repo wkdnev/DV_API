@@ -21,6 +21,8 @@
 // ============================================================================
 
 using DV.Shared.Models; // Imports models like Document, Project, etc.
+using DV.Shared.Interfaces;
+using DV.Shared.Security;
 using DV.API.Infrastructure.Caching;
 using Microsoft.EntityFrameworkCore; // Provides EF Core functionality
 
@@ -39,6 +41,13 @@ public class DocumentRepository
 {
     private readonly AppDbContext _context; // Entity Framework context
     private readonly ICacheService _cache;
+    private readonly IAccessGroupService? _accessGroupService;
+    private readonly SecurityDbContext? _securityContext;
+
+    // Explicit column lists to avoid SELECT * (prevents loading unnecessary data)
+    private const string DocumentColumns = "\"DocumentId\", \"ProjectId\", \"DocumentIndex\", \"Issue\", \"DocumentStatus\", \"DocumentNumber\", \"Title\", \"Author\", \"DocumentDate\", \"Keywords\", \"Memo\", \"DocumentType\", \"OldDM\", \"CM\", \"GM\", \"EM\", \"Text01\", \"Text02\", \"Text03\", \"Text04\", \"Text05\", \"Text06\", \"Text07\", \"Text08\", \"Text09\", \"Text10\", \"Text11\", \"Text12\", \"Date01\", \"Date02\", \"Date03\", \"Date04\", \"Boolean01\", \"Boolean02\", \"Boolean03\", \"Number01\", \"Number02\", \"Number03\", \"Version\", \"Status\", \"Classification\", \"FilePath\", \"CreatedOn\", \"CreatedBy\", \"ModifiedOn\", \"ModifiedBy\", \"PublicToken\"";
+    private const string DocumentListColumns = "\"DocumentId\", \"ProjectId\", \"DocumentNumber\", \"Title\", \"Author\", \"DocumentDate\", \"DocumentType\", \"Status\", \"Classification\", \"Keywords\", \"CreatedOn\", \"CreatedBy\", \"ModifiedOn\", \"ModifiedBy\", \"PublicToken\"";
+    private const string PageColumnsNoBlob = "\"PageId\", \"DocumentId\", \"DocumentIndex\", \"PageNumber\", \"PageReference\", \"FrameNumber\", \"Level1\", \"Level2\", \"Level3\", \"Level4\", \"DiskNumber\", \"FileName\", \"FilePath\", \"FileType\", CAST(NULL AS bytea) AS \"FileContent\", \"FileSize\", \"FileFormat\", \"PageSize\", \"ContentType\", \"UploadedDate\", \"ChecksumMD5\", \"StorageType\", \"CreatedOn\", \"CreatedBy\", \"ModifiedOn\", \"ModifiedBy\"";
 
     // ========================================================================
     // Constructor: DocumentRepository
@@ -46,11 +55,15 @@ public class DocumentRepository
     // Purpose: Initializes the repository with an Entity Framework context.
     // Parameters:
     // - context: An instance of AppDbContext for database operations.
-    public DocumentRepository(AppDbContext context, ICacheService cache)
+    public DocumentRepository(AppDbContext context, ICacheService cache, IAccessGroupService? accessGroupService = null, SecurityDbContext? securityContext = null)
     {
         _context = context;
         _cache = cache;
+        _accessGroupService = accessGroupService;
+        _securityContext = securityContext;
     }
+
+    public AppDbContext GetDbContext() => _context;
 
     // ========================================================================
     // Method: HasProjectAccessAsync
@@ -69,27 +82,86 @@ public class DocumentRepository
             return false;
         }
 
-        // 2. Extract Groups from Claims
-        var userGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var claim in user.Claims)
-        {
-            if (claim.Type == "groups" || 
-                claim.Type == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups" ||
-                claim.Type == "http://schemas.xmlsoap.org/claims/Group" || 
-                claim.Type == System.Security.Claims.ClaimTypes.GroupSid ||
-                claim.Type == System.Security.Claims.ClaimTypes.Role ||
-                claim.Type == "role") 
-            {
-                userGroups.Add(claim.Value);
-            }
-        }
+        // 2. Check AD claims AND app-managed group memberships
+        var userGroups = await GetUserGroupsAsync(user);
 
         // 3. Check Permissions
         bool canRead = !string.IsNullOrEmpty(project.ReadPrincipal) && userGroups.Contains(project.ReadPrincipal);
         bool canEdit = !string.IsNullOrEmpty(project.EditPrincipal) && userGroups.Contains(project.EditPrincipal);
         
         return canRead || canEdit;
+    }
+
+    // ========================================================================
+    // Method: HasProjectEditAccessAsync
+    // ========================================================================
+    // Purpose: Checks if a user has EDIT access to a specific project.
+    //          Only checks EditPrincipal (not ReadPrincipal).
+    // Used by: API controllers to enforce edit-level security on write operations.
+    public async Task<bool> HasProjectEditAccessAsync(System.Security.Claims.ClaimsPrincipal user, int projectId)
+    {
+        // Global Admins have full edit access
+        if (user.IsInRole(DV.Shared.Constants.Roles.GlobalAdminGroup))
+            return true;
+
+        var project = await GetProjectAsync("DefaultConnection", projectId);
+        if (project == null) return false;
+
+        var userGroups = await GetUserGroupsAsync(user);
+        return !string.IsNullOrEmpty(project.EditPrincipal) && userGroups.Contains(project.EditPrincipal);
+    }
+
+    // ========================================================================
+    // Method: GetUserGroupsAsync
+    // ========================================================================
+    // Purpose: Merges AD group claims with app-managed group memberships.
+    private async Task<HashSet<string>> GetUserGroupsAsync(System.Security.Claims.ClaimsPrincipal user)
+    {
+        var userGroups = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // 1. Extract AD groups from claims
+        foreach (var claim in user.Claims)
+        {
+            if (claim.Type == "groups" ||
+                claim.Type == "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups" ||
+                claim.Type == "http://schemas.xmlsoap.org/claims/Group" ||
+                claim.Type == System.Security.Claims.ClaimTypes.GroupSid ||
+                claim.Type == System.Security.Claims.ClaimTypes.Role ||
+                claim.Type == "role")
+            {
+                userGroups.Add(claim.Value);
+            }
+        }
+
+        // 2. Merge app-managed group memberships
+        if (_accessGroupService != null && _securityContext != null)
+        {
+            try
+            {
+                var username = user.Identity?.Name;
+                if (!string.IsNullOrEmpty(username))
+                {
+                    var dbUser = await _securityContext.Users
+                        .AsNoTracking()
+                        .FirstOrDefaultAsync(u => u.Username.ToLower() == username.ToLower());
+
+                    if (dbUser != null)
+                    {
+                        var appGroupNames = await _accessGroupService.GetUserGroupNamesAsync(dbUser.UserId);
+                        foreach (var groupName in appGroupNames)
+                        {
+                            userGroups.Add(groupName);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"GetUserGroupsAsync: Error loading app groups: {ex.Message}");
+            }
+        }
+
+        return userGroups;
     }
 
     // ========================================================================
@@ -170,18 +242,18 @@ public class DocumentRepository
     // Purpose: Searches for documents within a specific project schema.
     private async Task<IEnumerable<Document>> SearchInSchemaAsync(string schemaName, string? searchTerm, int page, int pageSize, int? projectId)
     {
-        var sql = $"SELECT * FROM [{schemaName}].[Document] WHERE 1=1";
+        var sql = $"SELECT {DocumentColumns} FROM \"{schemaName}\".\"Document\" WHERE 1=1";
         var parameters = new List<object>();
 
         if (projectId.HasValue)
         {
-            sql += " AND ProjectId = {" + parameters.Count + "}";
+            sql += " AND \"ProjectId\" = {" + parameters.Count + "}";
             parameters.Add(projectId.Value);
         }
 
         if (!string.IsNullOrWhiteSpace(searchTerm))
         {
-            sql += " AND (Title LIKE {" + parameters.Count + "} OR Author LIKE {" + (parameters.Count + 1) + "} OR DocumentNumber LIKE {" + (parameters.Count + 2) + "} OR Keywords LIKE {" + (parameters.Count + 3) + "})";
+            sql += " AND (\"Title\" LIKE {" + parameters.Count + "} OR \"Author\" LIKE {" + (parameters.Count + 1) + "} OR \"DocumentNumber\" LIKE {" + (parameters.Count + 2) + "} OR \"Keywords\" LIKE {" + (parameters.Count + 3) + "})";
             var searchPattern = $"%{searchTerm}%";
             parameters.Add(searchPattern);
             parameters.Add(searchPattern);
@@ -189,8 +261,8 @@ public class DocumentRepository
             parameters.Add(searchPattern);
         }
 
-        sql += " ORDER BY CreatedOn DESC";
-        sql += $" OFFSET {(page - 1) * pageSize} ROWS FETCH NEXT {pageSize} ROWS ONLY";
+        sql += " ORDER BY \"CreatedOn\" DESC";
+        sql += $" LIMIT {pageSize} OFFSET {(page - 1) * pageSize}";
 
         return await _context.Database.SqlQueryRaw<Document>(sql, parameters.ToArray()).ToListAsync();
     }
@@ -211,31 +283,34 @@ public class DocumentRepository
             return new List<Document>();
         }
 
-        var allDocuments = new List<Document>();
+        // Cap per-schema results to avoid loading entire tables into memory
+        var perSchemaLimit = pageSize * 3;
 
-        // Search in each schema
-        foreach (var project in projects)
-        {
-            if (projectId.HasValue && project.ProjectId != projectId.Value)
-                continue;
+        // Query each schema in parallel with capped results
+        var tasks = projects
+            .Where(p => !projectId.HasValue || p.ProjectId == projectId.Value)
+            .Select(project => SafeSearchInSchemaAsync(project.SchemaName, searchTerm, 1, perSchemaLimit, project.ProjectId));
 
-            try
-            {
-                var schemaDocuments = await SearchInSchemaAsync(project.SchemaName, searchTerm, 1, int.MaxValue, project.ProjectId);
-                allDocuments.AddRange(schemaDocuments);
-            }
-            catch
-            {
-                // Skip schemas that don't exist or have issues
-                continue;
-            }
-        }
+        var results = await Task.WhenAll(tasks);
 
-        // Apply pagination to combined results
-        return allDocuments
+        // Merge and paginate combined results
+        return results
+            .SelectMany(r => r)
             .OrderByDescending(d => d.CreatedOn)
             .Skip((page - 1) * pageSize)
             .Take(pageSize);
+    }
+
+    private async Task<IEnumerable<Document>> SafeSearchInSchemaAsync(string schemaName, string? searchTerm, int page, int pageSize, int? projectId)
+    {
+        try
+        {
+            return await SearchInSchemaAsync(schemaName, searchTerm, page, pageSize, projectId);
+        }
+        catch
+        {
+            return Enumerable.Empty<Document>();
+        }
     }
 
     // ========================================================================
@@ -248,30 +323,23 @@ public class DocumentRepository
     // Returns: A Document object or null if not found.
     public async Task<Document?> GetDocumentAsync(string database, int documentId)
     {
-        // Try to find the document across all schemas
-        var projects = await _context.Projects
-            .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
-            .ToListAsync();
-
-        foreach (var project in projects)
+        // Build a single UNION ALL query across all schemas instead of N+1 queries
+        var schemas = await _cache.GetOrSetAsync("projects:active-schemas", async () =>
         {
-            try
-            {
-                var sql = $"SELECT * FROM [{project.SchemaName}].[Document] WHERE DocumentId = {{0}}";
-                var document = await _context.Database.SqlQueryRaw<Document>(sql, documentId).FirstOrDefaultAsync();
-                if (document != null)
-                {
-                    return document;
-                }
-            }
-            catch
-            {
-                // Continue to next schema if this one fails
-                continue;
-            }
-        }
+            return await _context.Projects
+                .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
+                .Select(p => p.SchemaName)
+                .ToListAsync();
+        }, TimeSpan.FromMinutes(10));
 
-        return null;
+        if (!schemas.Any())
+            return null;
+
+        var unionParts = schemas.Select(schema =>
+            $"SELECT {DocumentColumns} FROM \"{schema}\".\"Document\" WHERE \"DocumentId\" = {{0}}");
+        var sql = string.Join(" UNION ALL ", unionParts);
+
+        return await _context.Database.SqlQueryRaw<Document>(sql, documentId).FirstOrDefaultAsync();
     }
 
     // ========================================================================
@@ -280,8 +348,80 @@ public class DocumentRepository
     // Purpose: Retrieves a specific document by its ID from a specific schema.
     public async Task<Document?> GetDocumentAsync(string database, string schemaName, int documentId)
     {
-        var sql = $"SELECT * FROM [{schemaName}].[Document] WHERE DocumentId = {{0}}";
+        var sql = $"SELECT {DocumentColumns} FROM \"{schemaName}\".\"Document\" WHERE \"DocumentId\" = {{0}}";
         return await _context.Database.SqlQueryRaw<Document>(sql, documentId).FirstOrDefaultAsync();
+    }
+
+    // ========================================================================
+    // Method: GetDocumentByTokenAsync
+    // ========================================================================
+    // Purpose: Retrieves a document by its opaque public token (UNION ALL across all schemas).
+    // Note: Document.SchemaName is [NotMapped] so SqlQueryRaw won't populate it.
+    //       We look up the schema from the Project table after the query.
+    public async Task<Document?> GetDocumentByTokenAsync(string token)
+    {
+        var schemas = await _cache.GetOrSetAsync("projects:active-schemas", async () =>
+        {
+            return await _context.Projects
+                .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
+                .Select(p => p.SchemaName)
+                .ToListAsync();
+        }, TimeSpan.FromMinutes(10));
+
+        if (!schemas.Any())
+            return null;
+
+        var unionParts = schemas.Select(schema =>
+            $"SELECT {DocumentColumns} FROM \"{schema}\".\"Document\" WHERE \"PublicToken\" = {{0}}");
+        var sql = string.Join(" UNION ALL ", unionParts);
+
+        var doc = await _context.Database.SqlQueryRaw<Document>(sql, token).FirstOrDefaultAsync();
+
+        if (doc?.ProjectId != null)
+        {
+            var project = await _context.Projects.FirstOrDefaultAsync(p => p.ProjectId == doc.ProjectId.Value);
+            doc.SchemaName = project?.SchemaName;
+        }
+
+        return doc;
+    }
+
+    // ========================================================================
+    // Method: BackfillDocumentTokensAsync
+    // ========================================================================
+    // Purpose: Generates PublicToken for any documents that don't have one yet.
+    public async Task<int> BackfillDocumentTokensAsync()
+    {
+        var schemas = await _context.Projects
+            .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
+            .Select(p => p.SchemaName)
+            .ToListAsync();
+
+        int totalUpdated = 0;
+        foreach (var schema in schemas)
+        {
+            try
+            {
+                var docs = await _context.Database
+                    .SqlQueryRaw<Document>($"SELECT {DocumentColumns} FROM \"{schema}\".\"Document\" WHERE \"PublicToken\" IS NULL")
+                    .ToListAsync();
+
+                foreach (var doc in docs)
+                {
+                    var token = DV.Shared.Constants.DocumentTokenGenerator.GenerateToken();
+                    await _context.Database.ExecuteSqlRawAsync(
+                        $"UPDATE \"{schema}\".\"Document\" SET \"PublicToken\" = {{0}} WHERE \"DocumentId\" = {{1}}",
+                        token, doc.DocumentId);
+                    totalUpdated++;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"BackfillDocumentTokensAsync: Error in schema '{schema}': {ex.Message}");
+            }
+        }
+
+        return totalUpdated;
     }
 
     // ========================================================================
@@ -290,30 +430,23 @@ public class DocumentRepository
     // Purpose: Retrieves all pages for a specific document.
     public async Task<IEnumerable<DocumentPage>> GetPagesAsync(string database, int documentId)
     {
-        // Try to find the document pages across all schemas
-        var projects = await _context.Projects
-            .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
-            .ToListAsync();
-
-        foreach (var project in projects)
+        // Build a single UNION ALL query across all schemas instead of N+1 queries
+        var schemas = await _cache.GetOrSetAsync("projects:active-schemas", async () =>
         {
-            try
-            {
-                var sql = $"SELECT * FROM [{project.SchemaName}].[DocumentPage] WHERE DocumentId = {{0}} ORDER BY PageNumber";
-                var pages = await _context.Database.SqlQueryRaw<DocumentPage>(sql, documentId).ToListAsync();
-                if (pages.Any())
-                {
-                    return pages;
-                }
-            }
-            catch
-            {
-                // Continue to next schema if this one fails
-                continue;
-            }
-        }
+            return await _context.Projects
+                .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
+                .Select(p => p.SchemaName)
+                .ToListAsync();
+        }, TimeSpan.FromMinutes(10));
 
-        return new List<DocumentPage>();
+        if (!schemas.Any())
+            return new List<DocumentPage>();
+
+        var unionParts = schemas.Select(schema =>
+            $"SELECT {PageColumnsNoBlob} FROM \"{schema}\".\"DocumentPage\" WHERE \"DocumentId\" = {{0}}");
+        var sql = string.Join(" UNION ALL ", unionParts) + " ORDER BY \"PageNumber\"";
+
+        return await _context.Database.SqlQueryRaw<DocumentPage>(sql, documentId).ToListAsync();
     }
 
     // ========================================================================
@@ -324,7 +457,7 @@ public class DocumentRepository
     {
         try
         {
-            var sql = $"SELECT * FROM [{schemaName}].[DocumentPage] WHERE DocumentId = {{0}} ORDER BY PageNumber";
+            var sql = $"SELECT {PageColumnsNoBlob} FROM \"{schemaName}\".\"DocumentPage\" WHERE \"DocumentId\" = {{0}} ORDER BY \"PageNumber\"";
             return await _context.Database.SqlQueryRaw<DocumentPage>(sql, documentId).ToListAsync();
         }
         catch
@@ -353,25 +486,15 @@ public class DocumentRepository
             .Where(p => p.IsActive && !string.IsNullOrEmpty(p.SchemaName))
             .ToListAsync();
 
-        foreach (var project in projects)
-        {
-            try
-            {
-                var sql = $"SELECT COUNT(*) FROM [{project.SchemaName}].[Document] WHERE DocumentId = {{0}}";
-                var count = await _context.Database.SqlQueryRaw<int>(sql, documentId).FirstOrDefaultAsync();
-                if (count > 0)
-                {
-                    return project.SchemaName;
-                }
-            }
-            catch
-            {
-                // Continue to next schema if this one fails
-                continue;
-            }
-        }
+        if (!projects.Any())
+            return null;
 
-        return null;
+        // Build a single UNION ALL query to find the schema in one round-trip
+        var unionParts = projects.Select(project =>
+            $"SELECT '{project.SchemaName}' AS \"Value\" FROM \"{project.SchemaName}\".\"Document\" WHERE \"DocumentId\" = {{0}}");
+        var sql = string.Join(" UNION ALL ", unionParts);
+
+        return await _context.Database.SqlQueryRaw<string>(sql, documentId).FirstOrDefaultAsync();
     }
 }
 

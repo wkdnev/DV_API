@@ -13,10 +13,14 @@ using DV.API.Infrastructure.Configuration;
 using DV.API.Infrastructure.HealthChecks;
 using DV.Shared.Models;
 using DV.Shared.Security;
+using DV.Shared.Interfaces;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.Extensions.Options;
+using System.Security.Claims;
 using DV.Shared.Constants;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -50,11 +54,11 @@ builder.Services.AddScoped<IInputValidationService, InputValidationService>();
 // Register AppDbContext for document data
 builder.Services.AddDbContext<AppDbContext>(options =>
 {
-    options.UseSqlServer(
+    options.UseNpgsql(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        sqlOptions => {
-            sqlOptions.EnableRetryOnFailure(maxRetryCount: 5);
-            sqlOptions.CommandTimeout(30);
+        npgsqlOptions => {
+            npgsqlOptions.EnableRetryOnFailure(maxRetryCount: 5);
+            npgsqlOptions.CommandTimeout(30);
         }
     );
 
@@ -68,11 +72,11 @@ builder.Services.AddDbContext<AppDbContext>(options =>
 // Register SecurityDbContext for security data
 builder.Services.AddDbContext<SecurityDbContext>(options =>
 {
-    options.UseSqlServer(
+    options.UseNpgsql(
         builder.Configuration.GetConnectionString("DefaultConnection"),
-        sqlOptions => {
-            sqlOptions.EnableRetryOnFailure(maxRetryCount: 5);
-            sqlOptions.CommandTimeout(30);
+        npgsqlOptions => {
+            npgsqlOptions.EnableRetryOnFailure(maxRetryCount: 5);
+            npgsqlOptions.CommandTimeout(30);
         }
     );
 
@@ -84,39 +88,40 @@ builder.Services.AddDbContext<SecurityDbContext>(options =>
 });
 
 // ============================================================================
-// Authentication Configuration (JWT from AD FS)
+// Authentication Configuration
 // ============================================================================
-var adfsAuthority = builder.Configuration["Adfs:Authority"];
-var adfsMetadata = builder.Configuration["Adfs:MetadataAddress"];
-var validAudiences = builder.Configuration.GetSection("Adfs:ValidAudiences").Get<string[]>() ?? new[] { "blazor-api" };
+if (builder.Environment.IsDevelopment())
+{
+    // Development: bypass AD FS, auto-authenticate as dev user
+    builder.Services.AddAuthentication("DevAuth")
+        .AddScheme<AuthenticationSchemeOptions, DevAuthenticationHandler>("DevAuth", null);
+    Console.WriteLine("*** DEVELOPMENT MODE: Authentication bypassed — auto-authenticating as AD\\neil.rainsforth ***");
+}
+else
+{
+    var adfsAuthority = builder.Configuration["Adfs:Authority"];
+    var adfsMetadata = builder.Configuration["Adfs:MetadataAddress"];
+    var validAudiences = builder.Configuration.GetSection("Adfs:ValidAudiences").Get<string[]>() ?? new[] { "blazor-api" };
 
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
-    {
-        options.Authority = adfsAuthority;
-        options.MetadataAddress = adfsMetadata;
-        options.RequireHttpsMetadata = true;
-        options.TokenValidationParameters = new TokenValidationParameters
+    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
         {
-            ValidateIssuer = true,
-            ValidIssuer = adfsAuthority,
-            ValidateAudience = true,
-            ValidAudiences = validAudiences,
-            ValidateLifetime = true,
-            ClockSkew = TimeSpan.FromMinutes(5),
-            RoleClaimType = "role", // Map 'role' claim to ClaimsPrincipal roles
-            NameClaimType = "unique_name"
-        };
-
-        // For development, allow self-signed certs
-        if (builder.Environment.IsDevelopment())
-        {
-            options.BackchannelHttpHandler = new HttpClientHandler
+            options.Authority = adfsAuthority;
+            options.MetadataAddress = adfsMetadata;
+            options.RequireHttpsMetadata = true;
+            options.TokenValidationParameters = new TokenValidationParameters
             {
-                ServerCertificateCustomValidationCallback = (message, cert, chain, errors) => true
+                ValidateIssuer = true,
+                ValidIssuer = adfsAuthority,
+                ValidateAudience = true,
+                ValidAudiences = validAudiences,
+                ValidateLifetime = true,
+                ClockSkew = TimeSpan.FromMinutes(5),
+                RoleClaimType = "role",
+                NameClaimType = "unique_name"
             };
-        }
-    });
+        });
+}
 
 // Authorization with GlobalAdmin support
 builder.Services.AddAuthorization(options =>
@@ -143,6 +148,9 @@ builder.Services.AddScoped<DocumentUploadService>();
 builder.Services.AddScoped<DocumentUploadResultService>();
 builder.Services.AddScoped<AuditService>();
 builder.Services.AddScoped<SessionManagementService>();
+builder.Services.AddTransient<ICredentialService, CredentialService>(); // NIST SP 800-53: Local credential management
+builder.Services.AddTransient<IAccessGroupService, AccessGroupService>(); // App-managed access groups
+builder.Services.AddScoped<NotificationService>();
 builder.Services.AddScoped<FirstUserAdminService>();
 // builder.Services.AddScoped<UserProjectAccessService>();
 builder.Services.AddScoped<SchemaBlobMigrationService>();
@@ -155,6 +163,25 @@ builder.Services.AddScoped<DV.API.Security.RoleService>();
 // Hosted services
 builder.Services.AddHostedService<SessionCleanupService>();
 
+// Bulk Export background processing
+builder.Services.AddSingleton<IExportTaskQueue, ExportTaskQueue>();
+builder.Services.AddSingleton<BulkExportService>();
+builder.Services.AddHostedService<ExportBackgroundService>();
+
+// ============================================================================
+// Session Configuration (NIST SP 800-53 AC-12 compliant)
+// ============================================================================
+builder.Services.AddDistributedMemoryCache();
+builder.Services.AddSession(options =>
+{
+    options.IdleTimeout = TimeSpan.FromMinutes(SessionConfig.IdleTimeoutMinutes);
+    options.Cookie.Name = SessionConfig.CookieName;
+    options.Cookie.HttpOnly = true;
+    options.Cookie.IsEssential = true;
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+});
+
 // ============================================================================
 // API Configuration
 // ============================================================================
@@ -163,26 +190,19 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
     c.SwaggerDoc("v1", new() { Title = "DocViewer API", Version = "v1" });
-    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.OpenApiSecurityScheme
     {
         Description = "JWT Authorization header using the Bearer scheme",
         Name = "Authorization",
-        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
-        Type = Microsoft.OpenApi.Models.SecuritySchemeType.ApiKey,
+        In = Microsoft.OpenApi.ParameterLocation.Header,
+        Type = Microsoft.OpenApi.SecuritySchemeType.ApiKey,
         Scheme = "Bearer"
     });
-    c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement
+    c.AddSecurityRequirement(_ => new Microsoft.OpenApi.OpenApiSecurityRequirement
     {
         {
-            new Microsoft.OpenApi.Models.OpenApiSecurityScheme
-            {
-                Reference = new Microsoft.OpenApi.Models.OpenApiReference
-                {
-                    Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
-                    Id = "Bearer"
-                }
-            },
-            Array.Empty<string>()
+            new Microsoft.OpenApi.OpenApiSecuritySchemeReference("Bearer"),
+            new List<string>()
         }
     });
 });
@@ -229,6 +249,9 @@ app.UseMiddleware<RequestResponseLoggingMiddleware>();
 
 app.UseAuthentication();
 
+// Session middleware (must be before session tracking)
+app.UseSession();
+
 // Session Tracking (Must run after Auth so User is populated)
 app.UseMiddleware<SessionTrackingMiddleware>();
 
@@ -240,4 +263,65 @@ app.UseMiddleware<RoleEnforcementMiddleware>();
 app.MapControllers();
 app.MapHealthChecks("/health");
 
+// Database schema migration + PublicToken backfill
+try
+{
+    using var scope = app.Services.CreateScope();
+    var migrationService = scope.ServiceProvider.GetRequiredService<DatabaseMigrationService>();
+    if (await migrationService.CheckIfMigrationNeededAsync())
+    {
+        Console.WriteLine("Running schema migrations...");
+        await migrationService.ExecuteProjectSchemaMigrationAsync();
+        Console.WriteLine("Schema migrations completed.");
+    }
+
+    // Migrate per-project schema tables (adds new columns like PublicToken)
+    var schemaService = scope.ServiceProvider.GetRequiredService<SchemaService>();
+    await schemaService.MigrateAllExistingSchemasAsync();
+
+    var repo = scope.ServiceProvider.GetRequiredService<DocumentRepository>();
+    var backfilled = await repo.BackfillDocumentTokensAsync();
+    if (backfilled > 0)
+        Console.WriteLine($"Backfilled PublicToken for {backfilled} documents.");
+}
+catch (Exception ex)
+{
+    Console.WriteLine($"Error during schema migration/backfill: {ex.Message}");
+}
+
 app.Run();
+
+// =============================================================================
+// Development-only authentication handler (bypasses AD FS)
+// =============================================================================
+public class DevAuthenticationHandler : AuthenticationHandler<AuthenticationSchemeOptions>
+{
+    public DevAuthenticationHandler(
+        IOptionsMonitor<AuthenticationSchemeOptions> options,
+        ILoggerFactory logger,
+        System.Text.Encodings.Web.UrlEncoder encoder)
+        : base(options, logger, encoder) { }
+
+    protected override Task<AuthenticateResult> HandleAuthenticateAsync()
+    {
+        // Check if the calling UI app forwarded the actual user's identity
+        var forwardedUser = Request.Headers["X-Forwarded-User"].FirstOrDefault();
+        var username = !string.IsNullOrEmpty(forwardedUser) ? forwardedUser : @"AD\neil.rainsforth";
+
+        var claims = new[]
+        {
+            new Claim("unique_name", username),
+            new Claim(System.Security.Claims.ClaimTypes.Name, username),
+            new Claim("role", Roles.GlobalAdminGroup),
+            new Claim("role", Roles.AdminGroup),
+            new Claim("role", Roles.AuditorGroup),
+            new Claim("role", Roles.SecurityGroup),
+            new Claim("groups", Roles.GlobalAdminGroup),
+            new Claim("auth_method", "dev_bypass"),
+        };
+        var identity = new ClaimsIdentity(claims, "DevAuth", "unique_name", "role");
+        var principal = new ClaimsPrincipal(identity);
+        var ticket = new AuthenticationTicket(principal, "DevAuth");
+        return Task.FromResult(AuthenticateResult.Success(ticket));
+    }
+}

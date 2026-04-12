@@ -1,4 +1,4 @@
-﻿// ============================================================================
+// ============================================================================
 // AppDbContext.cs - Database Context for Document Viewer Application
 // ============================================================================
 //
@@ -23,7 +23,7 @@
 
 using DV.Shared.Models; // Imports the entity models (Document, Project, etc.)
 using Microsoft.EntityFrameworkCore; // Provides EF Core functionality
-using Microsoft.Data.SqlClient; // Provides SqlParameter objects
+using Npgsql; // Provides NpgsqlParameter objects
 using System.Collections.Generic; // Provides collection types
 using System.Reflection.Emit; // Provides metadata emission functionality
 
@@ -82,7 +82,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(e => e.ReadPrincipal).HasMaxLength(255); // Optional read principal
             entity.Property(e => e.EditPrincipal).HasMaxLength(255); // Optional edit principal
             entity.Property(e => e.Description).HasMaxLength(1000); // Optional description
-            entity.Property(e => e.CreatedDate).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedDate).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.IsActive).HasDefaultValue(true); // Default to active
 
             // Add unique constraints
@@ -96,7 +96,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.ToTable("Programme", "dbo"); // Maps the entity to the "Programme" table in dbo schema
             entity.HasKey(e => e.ProgrammeId); // Sets the primary key
             entity.Property(e => e.ProgrammeName).IsRequired().HasMaxLength(255); // Programme name is required
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -114,7 +114,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(e => e.Available).HasDefaultValue(true); // Default to available
             entity.Property(e => e.DriveMappingID).IsRequired(); // Drive mapping ID is required
             entity.Property(e => e.ProjectID).IsRequired(); // Project ID is required (FK to Project)
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -138,7 +138,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(e => e.ShareName).IsRequired().HasMaxLength(50); // Share name is required
             entity.Property(e => e.DirectoryPath).IsRequired().HasMaxLength(255); // Directory path is required
             entity.Property(e => e.Description).IsRequired().HasMaxLength(255); // Description is required
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -150,7 +150,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.HasKey(e => e.SheetTypeId); // Sets the primary key
             entity.Property(e => e.SheetTypeCode).IsRequired().HasMaxLength(3); // 3-character code (e.g., "INV", "RCP")
             entity.Property(e => e.SheetTypeName).IsRequired().HasMaxLength(50); // Full name (e.g., "Invoice", "Receipt")
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -164,7 +164,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.ToTable("OldDM", "dbo"); // Maps the entity to the "OldDM" table in dbo schema
             entity.HasKey(e => e.OldDMId); // Sets the primary key
             entity.Property(e => e.OldDMName).HasMaxLength(50); // Optional name (nullable, max 50 chars)
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -175,7 +175,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.ToTable("CM", "dbo"); // Maps the entity to the "CM" table in dbo schema
             entity.HasKey(e => e.CMId); // Sets the primary key
             entity.Property(e => e.CMName).HasMaxLength(50); // Optional name (nullable, max 50 chars)
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -186,7 +186,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.ToTable("EM", "dbo"); // Maps the entity to the "EM" table in dbo schema
             entity.HasKey(e => e.EMId); // Sets the primary key
             entity.Property(e => e.EMName).HasMaxLength(50); // Optional name (nullable, max 50 chars)
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -197,7 +197,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.ToTable("GM", "dbo"); // Maps the entity to the "GM" table in dbo schema
             entity.HasKey(e => e.GMId); // Sets the primary key
             entity.Property(e => e.GMName).HasMaxLength(50); // Optional name (nullable, max 50 chars)
-            entity.Property(e => e.CreatedOn).HasDefaultValueSql("GETUTCDATE()"); // Default creation date
+            entity.Property(e => e.CreatedOn).HasDefaultValueSql("NOW() AT TIME ZONE 'UTC'"); // Default creation date
             entity.Property(e => e.CreatedBy).IsRequired(); // Created by user ID is required
             entity.Property(e => e.ModifiedOn); // Optional modification date
             entity.Property(e => e.ModifiedBy); // Optional modified by user ID
@@ -218,7 +218,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     /// </summary>
     public async Task<List<Document>> GetDocumentsFromSchemaAsync(string schemaName, string? whereClause = null, object? parameters = null)
     {
-        var sql = $"SELECT * FROM [{schemaName}].[Document]";
+        var sql = $"SELECT * FROM \"{schemaName}\".\"Document\"";
         if (!string.IsNullOrEmpty(whereClause))
         {
             sql += $" WHERE {whereClause}";
@@ -234,13 +234,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public async Task<bool> SchemaExistsAsync(string schemaName)
     {
         var sql = @"
-            SELECT COUNT(*) AS SchemaTableCount
-            FROM sys.schemas s
-            INNER JOIN sys.tables t1 ON s.schema_id = t1.schema_id AND t1.name = 'Document'
-            INNER JOIN sys.tables t2 ON s.schema_id = t2.schema_id AND t2.name = 'DocumentPage'
-            WHERE s.name = @schemaName";
+            SELECT COUNT(*)::int
+            FROM information_schema.schemata s
+            WHERE s.schema_name = @schemaName
+              AND EXISTS (SELECT 1 FROM information_schema.tables t1 WHERE t1.table_schema = @schemaName AND t1.table_name = 'Document')
+              AND EXISTS (SELECT 1 FROM information_schema.tables t2 WHERE t2.table_schema = @schemaName AND t2.table_name = 'DocumentPage')";
 
-        var parameters = new[] { new Microsoft.Data.SqlClient.SqlParameter("@schemaName", schemaName) };
+        var parameters = new[] { new NpgsqlParameter("@schemaName", schemaName) };
         var count = await Database.SqlQueryRaw<int>(sql, parameters).FirstOrDefaultAsync();
         return count > 0;
     }

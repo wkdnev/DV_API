@@ -1,16 +1,18 @@
-﻿using DV.Shared.Security;
+using DV.Shared.Security;
+using DV.Shared.Constants;
+using DV.Shared.DTOs;
+using DV.Shared.Interfaces;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.AspNetCore.Http;
-using System.Text.Json;
-
 using DV.API.Data;
 
 namespace DV.API.Services;
 
 /// <summary>
-/// Service for comprehensive session management and tracking
+/// NIST SP 800-53 Rev 5 compliant session management service.
+/// Implements AC-12 (Session Termination), AC-10 (Concurrent Session Control),
+/// SC-23 (Session Authenticity) controls.
 /// </summary>
-public class SessionManagementService
+public class SessionManagementService : ISessionManagementService
 {
     private readonly SecurityDbContext _securityContext;
     private readonly IHttpContextAccessor _httpContextAccessor;
@@ -30,7 +32,8 @@ public class SessionManagementService
     }
 
     /// <summary>
-    /// Initialize or update a user session
+    /// Initialize or update a user session with sliding + absolute timeout enforcement.
+    /// AC-10: Enforces concurrent session limit per user.
     /// </summary>
     public async Task<UserSession> InitializeSessionAsync(string username, int? userId, string? currentRole = null)
     {
@@ -38,32 +41,54 @@ public class SessionManagementService
         {
             var httpContext = _httpContextAccessor.HttpContext;
             if (httpContext?.Session == null)
-            {
                 throw new InvalidOperationException("Session is not available");
-            }
 
             var sessionKey = httpContext.Session.Id;
             var ipAddress = GetClientIpAddress(httpContext);
             var userAgent = httpContext.Request.Headers["User-Agent"].FirstOrDefault();
+            var now = DateTime.UtcNow;
 
-            // Check if session already exists
+            // Check for existing active session with this key
             var existingSession = await _securityContext.UserSessions
                 .FirstOrDefaultAsync(s => s.SessionKey == sessionKey && s.IsActive);
 
             if (existingSession != null)
             {
-                // Update existing session
-                existingSession.LastActivity = DateTime.UtcNow;
-                existingSession.CurrentRole = currentRole;
-                
-                await _securityContext.SaveChangesAsync();
-                
-                // Log activity
-                await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.PageView, 
-                    "Session Updated", httpContext.Request.Path);
+                // AC-12: Check absolute timeout (session cannot exceed max lifetime)
+                if ((now - existingSession.CreatedAt).TotalHours >= SessionConfig.AbsoluteTimeoutHours)
+                {
+                    existingSession.IsActive = false;
+                    existingSession.TerminatedAt = now;
+                    await _securityContext.SaveChangesAsync();
+                    await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.AbsoluteTimeout,
+                        "Absolute Timeout", $"Session exceeded {SessionConfig.AbsoluteTimeoutHours}h maximum lifetime");
+                    _logger.LogInformation("Session {SessionKey} terminated: absolute timeout for {Username}", sessionKey, username);
+                    // Fall through to create a new session
+                }
+                else
+                {
+                    // SC-23: Detect session anomalies (IP or User-Agent change)
+                    if (existingSession.IpAddress != ipAddress || existingSession.UserAgent != userAgent)
+                    {
+                        _logger.LogWarning("Session anomaly for {Username}: IP {OldIp}->{NewIp}, UA changed: {UaChanged}",
+                            username, existingSession.IpAddress, ipAddress, existingSession.UserAgent != userAgent);
+                        await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.AnomalyDetected,
+                            "Session Anomaly", $"IP: {existingSession.IpAddress}->{ipAddress}");
+                    }
 
-                return existingSession;
+                    // Sliding expiration: extend ExpiresAt on every activity
+                    existingSession.LastActivity = now;
+                    existingSession.ExpiresAt = now.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+                    if (currentRole != null)
+                        existingSession.CurrentRole = currentRole;
+
+                    await _securityContext.SaveChangesAsync();
+                    return existingSession;
+                }
             }
+
+            // AC-10: Enforce concurrent session limit before creating new session
+            await EnforceConcurrentSessionLimitAsync(username, now);
 
             // Create new session
             var session = new UserSession
@@ -74,20 +99,18 @@ public class SessionManagementService
                 IpAddress = ipAddress,
                 UserAgent = userAgent,
                 CurrentRole = currentRole,
-                CreatedAt = DateTime.UtcNow,
-                LastActivity = DateTime.UtcNow,
-                ExpiresAt = DateTime.UtcNow.AddHours(2), // Match session timeout from Program.cs
+                CreatedAt = now,
+                LastActivity = now,
+                ExpiresAt = now.AddMinutes(SessionConfig.IdleTimeoutMinutes),
                 IsActive = true
             };
 
             _securityContext.UserSessions.Add(session);
             await _securityContext.SaveChangesAsync();
 
-            // Log session creation
-            await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.Login, 
-                "Session Created", "New user session initialized");
+            await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.Login,
+                "Session Created", $"New session from {ipAddress}");
 
-            // Log to audit system
             await _auditService.LogEventAsync(new AuditLog
             {
                 EventType = AuditEventTypes.Authentication,
@@ -100,20 +123,19 @@ public class SessionManagementService
                 SessionId = sessionKey
             });
 
-            _logger.LogInformation("Session initialized for user {Username} with session {SessionKey}", 
-                username, sessionKey);
-
+            _logger.LogInformation("Session initialized for {Username} with key {SessionKey}", username, sessionKey);
             return session;
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error initializing session for user {Username}", username);
+            _logger.LogError(ex, "Error initializing session for {Username}", username);
             throw;
         }
     }
 
     /// <summary>
-    /// Update session activity
+    /// Update session activity with throttling to reduce DB writes.
+    /// Only writes if last activity was more than ActivityThrottleSeconds ago.
     /// </summary>
     public async Task UpdateSessionActivityAsync(string? activityType = null, string? action = null, string? resource = null)
     {
@@ -123,77 +145,57 @@ public class SessionManagementService
             if (httpContext?.Session == null) return;
 
             var sessionKey = httpContext.Session.Id;
+            var now = DateTime.UtcNow;
+
             var session = await _securityContext.UserSessions
                 .FirstOrDefaultAsync(s => s.SessionKey == sessionKey && s.IsActive);
 
-            if (session != null)
-            {
-                session.LastActivity = DateTime.UtcNow;
-                await _securityContext.SaveChangesAsync();
+            if (session == null) return;
 
-                if (!string.IsNullOrEmpty(activityType))
-                {
-                    await LogSessionActivityAsync(session.SessionId, activityType, action, resource);
-                }
+            // Throttle: only update if enough time has passed since last activity
+            var secondsSinceLastActivity = (now - session.LastActivity).TotalSeconds;
+            if (secondsSinceLastActivity < SessionConfig.ActivityThrottleSeconds && string.IsNullOrEmpty(activityType))
+                return;
+
+            // Sliding expiration: extend on activity
+            session.LastActivity = now;
+            session.ExpiresAt = now.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+            await _securityContext.SaveChangesAsync();
+
+            // Only log explicit activity types (not routine heartbeats)
+            if (!string.IsNullOrEmpty(activityType) && activityType != "Activity")
+            {
+                await LogSessionActivityAsync(session.SessionId, activityType, action, resource);
             }
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error updating session activity");
-            // Don't throw - session activity logging should not break the application
         }
     }
 
     /// <summary>
-    /// Check if a user's session is valid
+    /// Check if a session is valid (active, not expired, within absolute timeout).
     /// </summary>
-    public async Task<bool> IsUserSessionValidAsync(string username, string? sessionKey)
+    public async Task<bool> IsSessionValidAsync(string? sessionKey)
     {
-        // 1. If we have a sessionKey, checks specific session
-        if (!string.IsNullOrEmpty(sessionKey))
-        {
-            var session = await _securityContext.UserSessions
-                .FirstOrDefaultAsync(s => s.SessionKey == sessionKey);
-            
-            // If session exists, it MUST be active
-            if (session != null)
-            {
-                return session.IsActive && session.ExpiresAt > DateTime.UtcNow;
-            }
-        }
-        
-        // 2. If no specific session key or session record not found (yet),
-        // Check if the user has been globally terminated or has ANY active session?
-        // For OIDC, we might be lenient if the DB record hasn't been created yet (race condition on login).
-        // BUT strict security says "No record, no access".
-        // Let's check if the USER has any active sessions. If they have 0, they might be logged out everywhere.
-        // However, this might block new logins.
-        
-        // Compromise for this implementation:
-        // We assume InitializeSessionAsync runs before this check or shortly after.
-        // But for "Revoke", we usually query by Username if we don't have the key.
-        
-        // Let's query: Is there any explicit "Terminated" session that matches recent time? 
-        // Or simply: Does the user have *at least one* active session?
-        
-        var activeSessions = await _securityContext.UserSessions
-            .AnyAsync(s => s.Username == username && s.IsActive && s.ExpiresAt > DateTime.UtcNow);
-            
-        // If the user has valid credentials (OIDC) but no DB session, it's likely a new login 
-        // that hasn't hit InitializeSessionAsync fully, OR session was killed.
-        // If we return 'false', a valid OIDC user gets 401. 
-        // We should allow if "No explicit termination"?
-        
-        // Strict approach: Return true only if active session exists.
-        // To prevent lockout on login race: usage of InitializeSessionAsync in Middleware *before* check is crucial.
-        // Looking at middleware order: SessionTracking runs BEFORE RoleEnforcement? 
-        // We need to verify Program.cs order.
-        
-        return activeSessions; 
+        if (string.IsNullOrEmpty(sessionKey)) return false;
+
+        var now = DateTime.UtcNow;
+        var session = await _securityContext.UserSessions
+            .FirstOrDefaultAsync(s => s.SessionKey == sessionKey);
+
+        if (session == null) return true; // No DB record yet = new login, allow through
+
+        if (!session.IsActive) return false;
+        if (session.ExpiresAt <= now) return false;
+        if ((now - session.CreatedAt).TotalHours >= SessionConfig.AbsoluteTimeoutHours) return false;
+
+        return true;
     }
 
     /// <summary>
-    /// Update current role for session
+    /// Update current role for the active session.
     /// </summary>
     public async Task UpdateSessionRoleAsync(string newRole)
     {
@@ -206,30 +208,27 @@ public class SessionManagementService
             var session = await _securityContext.UserSessions
                 .FirstOrDefaultAsync(s => s.SessionKey == sessionKey && s.IsActive);
 
-            if (session != null)
+            if (session == null) return;
+
+            var oldRole = session.CurrentRole;
+            session.CurrentRole = newRole;
+            session.LastActivity = DateTime.UtcNow;
+            session.ExpiresAt = DateTime.UtcNow.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+            await _securityContext.SaveChangesAsync();
+
+            await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.RoleSwitch,
+                "Role Changed", $"'{oldRole}' -> '{newRole}'");
+
+            await _auditService.LogEventAsync(new AuditLog
             {
-                var oldRole = session.CurrentRole;
-                session.CurrentRole = newRole;
-                session.LastActivity = DateTime.UtcNow;
-                
-                await _securityContext.SaveChangesAsync();
-
-                // Log role switch
-                await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.RoleSwitch, 
-                    "Role Changed", $"From '{oldRole}' to '{newRole}'");
-
-                // Log to audit system
-                await _auditService.LogEventAsync(new AuditLog
-                {
-                    EventType = AuditEventTypes.Authentication,
-                    Action = "RoleSwitch",
-                    Username = session.Username,
-                    UserId = session.UserId,
-                    Result = AuditResults.Success,
-                    Details = $"Role changed from '{oldRole}' to '{newRole}'",
-                    SessionId = sessionKey
-                });
-            }
+                EventType = AuditEventTypes.Authentication,
+                Action = "RoleSwitch",
+                Username = session.Username,
+                UserId = session.UserId,
+                Result = AuditResults.Success,
+                Details = $"Role changed from '{oldRole}' to '{newRole}'",
+                SessionId = sessionKey
+            });
         }
         catch (Exception ex)
         {
@@ -238,65 +237,51 @@ public class SessionManagementService
     }
 
     /// <summary>
-    /// Update current role for user's most recent session (for Blazor Server where HttpContext.Session may not be available)
+    /// Update role by username (for Blazor Server where HttpContext.Session may not be available).
     /// </summary>
     public async Task UpdateSessionRoleByUsernameAsync(string username, string newRole)
     {
-        _logger.LogInformation("UpdateSessionRoleByUsernameAsync called for user {Username} with role {Role}", username, newRole);
-        
         try
         {
-            // Get the most recent active session for this user, or create one if none exists
-            var allSessions = await _securityContext.UserSessions
-                .Where(s => s.Username == username)
+            var session = await _securityContext.UserSessions
+                .Where(s => s.Username == username && s.IsActive)
                 .OrderByDescending(s => s.LastActivity)
-                .ToListAsync();
-            
-            _logger.LogInformation("Found {Count} total sessions for user {Username}", allSessions.Count, username);
-            
-            var session = allSessions.FirstOrDefault();
+                .FirstOrDefaultAsync();
 
-            if (session != null)
+            if (session == null)
             {
-                _logger.LogInformation("Updating session {SessionKey}: OldRole={OldRole}, IsActive={IsActive}", 
-                    session.SessionKey, session.CurrentRole ?? "(null)", session.IsActive);
-                
-                var oldRole = session.CurrentRole;
-                session.CurrentRole = newRole;
-                session.LastActivity = DateTime.UtcNow;
-                session.IsActive = true; // Ensure session is active
-                
-                _logger.LogInformation("Updated session role for user {Username}: {OldRole} -> {NewRole}, SessionId: {SessionId}, Setting IsActive=true", 
-                    username, oldRole ?? "(null)", newRole, session.SessionId);
-                
-                var changes = await _securityContext.SaveChangesAsync();
-                _logger.LogInformation("SaveChangesAsync completed: {Changes} entities updated", changes);
+                _logger.LogWarning("No active session found for {Username} to update role", username);
+                return;
+            }
 
-                // Log to audit system
-                await _auditService.LogEventAsync(new AuditLog
-                {
-                    EventType = AuditEventTypes.Authentication,
-                    Action = "RoleSwitch",
-                    Username = session.Username,
-                    UserId = session.UserId,
-                    Result = AuditResults.Success,
-                    Details = $"Role changed from '{oldRole}' to '{newRole}'",
-                    SessionId = session.SessionKey
-                });
-            }
-            else
+            var oldRole = session.CurrentRole;
+            session.CurrentRole = newRole;
+            session.LastActivity = DateTime.UtcNow;
+            session.ExpiresAt = DateTime.UtcNow.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+            await _securityContext.SaveChangesAsync();
+
+            _logger.LogInformation("Session role updated for {Username}: '{OldRole}' -> '{NewRole}'",
+                username, oldRole, newRole);
+
+            await _auditService.LogEventAsync(new AuditLog
             {
-                _logger.LogWarning("No session found for user {Username} to update role", username);
-            }
+                EventType = AuditEventTypes.Authentication,
+                Action = "RoleSwitch",
+                Username = session.Username,
+                UserId = session.UserId,
+                Result = AuditResults.Success,
+                Details = $"Role changed from '{oldRole}' to '{newRole}'",
+                SessionId = session.SessionKey
+            });
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error updating session role by username for {Username}", username);
+            _logger.LogError(ex, "Error updating session role for {Username}", username);
         }
     }
 
     /// <summary>
-    /// Terminate a session (logout or admin termination)
+    /// Terminate a specific session.
     /// </summary>
     public async Task<bool> TerminateSessionAsync(string sessionKey, string? terminatedBy = null, bool isAdminTermination = false)
     {
@@ -311,15 +296,12 @@ public class SessionManagementService
             session.TerminatedAt = DateTime.UtcNow;
             session.AdminTerminated = isAdminTermination;
             session.TerminatedBy = terminatedBy;
-
             await _securityContext.SaveChangesAsync();
 
-            // Log termination
             var activityType = isAdminTermination ? SessionActivityTypes.AdminTermination : SessionActivityTypes.Logout;
-            await LogSessionActivityAsync(session.SessionId, activityType, 
-                "Session Terminated", isAdminTermination ? $"Terminated by admin: {terminatedBy}" : "User logout");
+            await LogSessionActivityAsync(session.SessionId, activityType,
+                "Session Terminated", isAdminTermination ? $"By admin: {terminatedBy}" : "User logout");
 
-            // Log to audit system
             await _auditService.LogEventAsync(new AuditLog
             {
                 EventType = isAdminTermination ? AuditEventTypes.SystemAdmin : AuditEventTypes.Authentication,
@@ -331,9 +313,8 @@ public class SessionManagementService
                 SessionId = sessionKey
             });
 
-            _logger.LogInformation("Session {SessionKey} terminated for user {Username}. Admin termination: {IsAdmin}", 
+            _logger.LogInformation("Session {SessionKey} terminated for {Username}. AdminTermination: {IsAdmin}",
                 sessionKey, session.Username, isAdminTermination);
-
             return true;
         }
         catch (Exception ex)
@@ -344,103 +325,143 @@ public class SessionManagementService
     }
 
     /// <summary>
-    /// Get all active sessions
+    /// Terminate all active sessions for a user.
     /// </summary>
+    public async Task TerminateAllUserSessionsAsync(string username, string? terminatedBy = null)
+    {
+        try
+        {
+            var activeSessions = await _securityContext.UserSessions
+                .Where(s => s.Username == username && s.IsActive)
+                .ToListAsync();
+
+            var now = DateTime.UtcNow;
+            foreach (var session in activeSessions)
+            {
+                session.IsActive = false;
+                session.TerminatedAt = now;
+                session.AdminTerminated = terminatedBy != null;
+                session.TerminatedBy = terminatedBy;
+            }
+
+            await _securityContext.SaveChangesAsync();
+            _logger.LogInformation("Terminated {Count} sessions for {Username}", activeSessions.Count, username);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error terminating all sessions for {Username}", username);
+        }
+    }
+
     public async Task<List<UserSession>> GetActiveSessionsAsync()
     {
+        var now = DateTime.UtcNow;
+        var absoluteCutoff = now.AddHours(-SessionConfig.AbsoluteTimeoutHours);
+
         return await _securityContext.UserSessions
             .Include(s => s.User)
-            .Where(s => s.IsActive && s.ExpiresAt > DateTime.UtcNow)
+            .Where(s => s.IsActive && s.ExpiresAt > now && s.CreatedAt > absoluteCutoff)
             .OrderByDescending(s => s.LastActivity)
             .ToListAsync();
     }
 
-    /// <summary>
-    /// Get session by ID
-    /// </summary>
     public async Task<UserSession?> GetSessionByIdAsync(int sessionId)
     {
-         return await _securityContext.UserSessions
+        return await _securityContext.UserSessions
             .Include(s => s.User)
             .FirstOrDefaultAsync(s => s.SessionId == sessionId);
     }
 
-    /// <summary>
-    /// Get sessions for a specific user
-    /// </summary>
     public async Task<List<UserSession>> GetUserSessionsAsync(int userId, bool activeOnly = true)
     {
         var query = _securityContext.UserSessions.Where(s => s.UserId == userId);
-        
+
         if (activeOnly)
         {
-            query = query.Where(s => s.IsActive && s.ExpiresAt > DateTime.UtcNow);
+            var now = DateTime.UtcNow;
+            var absoluteCutoff = now.AddHours(-SessionConfig.AbsoluteTimeoutHours);
+            query = query.Where(s => s.IsActive && s.ExpiresAt > now && s.CreatedAt > absoluteCutoff);
         }
 
-        return await query
-            .OrderByDescending(s => s.LastActivity)
-            .ToListAsync();
+        return await query.OrderByDescending(s => s.LastActivity).ToListAsync();
     }
 
-    /// <summary>
-    /// Get session statistics
-    /// </summary>
     public async Task<SessionStatistics> GetSessionStatisticsAsync()
     {
         var now = DateTime.UtcNow;
         var today = now.Date;
         var yesterday = today.AddDays(-1);
+        var absoluteCutoff = now.AddHours(-SessionConfig.AbsoluteTimeoutHours);
+
+        // Sequential queries to avoid DbContext concurrency issues
+        var totalActive = await _securityContext.UserSessions
+            .CountAsync(s => s.IsActive && s.ExpiresAt > now && s.CreatedAt > absoluteCutoff);
+
+        var totalToday = await _securityContext.UserSessions
+            .CountAsync(s => s.CreatedAt >= today);
+
+        var totalYesterday = await _securityContext.UserSessions
+            .CountAsync(s => s.CreatedAt >= yesterday && s.CreatedAt < today);
+
+        var uniqueToday = await _securityContext.UserSessions
+            .Where(s => s.CreatedAt >= today)
+            .Select(s => s.UserId)
+            .Distinct()
+            .CountAsync();
+
+        var adminTerminated = await _securityContext.UserSessions
+            .CountAsync(s => s.AdminTerminated);
+
+        var avgDuration = await GetAverageSessionDurationAsync();
+        var topUsers = await GetTopActiveUsersAsync(5);
 
         return new SessionStatistics
         {
-            TotalActiveSessions = await _securityContext.UserSessions
-                .CountAsync(s => s.IsActive && s.ExpiresAt > now),
-            
-            TotalSessionsToday = await _securityContext.UserSessions
-                .CountAsync(s => s.CreatedAt >= today),
-            
-            TotalSessionsYesterday = await _securityContext.UserSessions
-                .CountAsync(s => s.CreatedAt >= yesterday && s.CreatedAt < today),
-            
-            UniqueUsersToday = await _securityContext.UserSessions
-                .Where(s => s.CreatedAt >= today)
-                .Select(s => s.UserId)
-                .Distinct()
-                .CountAsync(),
-            
-            AdminTerminatedSessions = await _securityContext.UserSessions
-                .CountAsync(s => s.AdminTerminated),
-            
-            AverageSessionDuration = await GetAverageSessionDurationAsync(),
-            
-            TopActiveUsers = await GetTopActiveUsersAsync(5)
+            TotalActiveSessions = totalActive,
+            TotalSessionsToday = totalToday,
+            TotalSessionsYesterday = totalYesterday,
+            UniqueUsersToday = uniqueToday,
+            AdminTerminatedSessions = adminTerminated,
+            AverageSessionDuration = avgDuration,
+            TopActiveUsers = topUsers
         };
     }
 
     /// <summary>
-    /// Clean up expired sessions
+    /// Clean up expired and stale sessions.
+    /// Handles idle timeout, absolute timeout, and orphaned sessions.
     /// </summary>
     public async Task<int> CleanupExpiredSessionsAsync()
     {
         try
         {
+            var now = DateTime.UtcNow;
+            var absoluteCutoff = now.AddHours(-SessionConfig.AbsoluteTimeoutHours);
+
+            // Find sessions that are idle-expired OR absolute-expired
             var expiredSessions = await _securityContext.UserSessions
-                .Where(s => s.IsActive && s.ExpiresAt <= DateTime.UtcNow)
+                .Where(s => s.IsActive && (s.ExpiresAt <= now || s.CreatedAt <= absoluteCutoff))
                 .ToListAsync();
 
             foreach (var session in expiredSessions)
             {
                 session.IsActive = false;
-                session.TerminatedAt = DateTime.UtcNow;
+                session.TerminatedAt = now;
 
-                // Log expiration
-                await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.IdleTimeout, 
-                    "Session Expired", "Automatic cleanup - session timeout");
+                var reason = session.CreatedAt <= absoluteCutoff
+                    ? SessionActivityTypes.AbsoluteTimeout
+                    : SessionActivityTypes.IdleTimeout;
+
+                await LogSessionActivityAsync(session.SessionId, reason,
+                    "Session Expired", $"Cleanup: {reason}");
             }
 
-            await _securityContext.SaveChangesAsync();
+            if (expiredSessions.Count > 0)
+            {
+                await _securityContext.SaveChangesAsync();
+                _logger.LogInformation("Cleaned up {Count} expired sessions", expiredSessions.Count);
+            }
 
-            _logger.LogInformation("Cleaned up {Count} expired sessions", expiredSessions.Count);
             return expiredSessions.Count;
         }
         catch (Exception ex)
@@ -450,35 +471,64 @@ public class SessionManagementService
         }
     }
 
+    // ========================================================================
+    // Private helpers
+    // ========================================================================
+
     /// <summary>
-    /// Log session activity
+    /// AC-10: Enforce maximum concurrent sessions per user.
+    /// Terminates oldest sessions when limit is exceeded.
     /// </summary>
+    private async Task EnforceConcurrentSessionLimitAsync(string username, DateTime now)
+    {
+        var activeSessions = await _securityContext.UserSessions
+            .Where(s => s.Username == username && s.IsActive && s.ExpiresAt > now)
+            .OrderByDescending(s => s.LastActivity)
+            .ToListAsync();
+
+        if (activeSessions.Count >= SessionConfig.MaxConcurrentSessionsPerUser)
+        {
+            // Terminate oldest sessions beyond the limit (keep newest N-1, since we are about to create one)
+            var sessionsToTerminate = activeSessions
+                .Skip(SessionConfig.MaxConcurrentSessionsPerUser - 1)
+                .ToList();
+
+            foreach (var oldSession in sessionsToTerminate)
+            {
+                oldSession.IsActive = false;
+                oldSession.TerminatedAt = now;
+                oldSession.TerminatedBy = "System";
+
+                await LogSessionActivityAsync(oldSession.SessionId, SessionActivityTypes.ConcurrentSessionEviction,
+                    "Evicted", $"Concurrent session limit ({SessionConfig.MaxConcurrentSessionsPerUser}) exceeded");
+            }
+
+            await _securityContext.SaveChangesAsync();
+            _logger.LogInformation("Evicted {Count} old sessions for {Username} (concurrent limit: {Limit})",
+                sessionsToTerminate.Count, username, SessionConfig.MaxConcurrentSessionsPerUser);
+        }
+    }
+
     private async Task LogSessionActivityAsync(int sessionId, string activityType, string? action = null, string? resource = null)
     {
         try
         {
-            var activity = new SessionActivity
+            _securityContext.SessionActivities.Add(new SessionActivity
             {
                 SessionId = sessionId,
                 ActivityType = activityType,
                 Action = action,
                 Resource = resource,
                 Timestamp = DateTime.UtcNow
-            };
-
-            _securityContext.SessionActivities.Add(activity);
+            });
             await _securityContext.SaveChangesAsync();
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error logging session activity");
-            // Don't throw - activity logging should not break the application
         }
     }
 
-    /// <summary>
-    /// Get client IP address
-    /// </summary>
     private string? GetClientIpAddress(HttpContext context)
     {
         var xForwardedFor = context.Request.Headers["X-Forwarded-For"].FirstOrDefault();
@@ -492,15 +542,13 @@ public class SessionManagementService
         return context.Connection.RemoteIpAddress?.ToString();
     }
 
-    /// <summary>
-    /// Get average session duration
-    /// </summary>
     private async Task<TimeSpan> GetAverageSessionDurationAsync()
     {
         var sessions = await _securityContext.UserSessions
             .Where(s => !s.IsActive && s.TerminatedAt.HasValue)
+            .OrderByDescending(s => s.TerminatedAt)
             .Select(s => new { s.CreatedAt, s.TerminatedAt })
-            .Take(100) // Sample recent sessions
+            .Take(100)
             .ToListAsync();
 
         if (!sessions.Any()) return TimeSpan.Zero;
@@ -512,13 +560,10 @@ public class SessionManagementService
         return TimeSpan.FromMinutes(totalMinutes);
     }
 
-    /// <summary>
-    /// Get top active users
-    /// </summary>
     private async Task<List<UserSessionSummary>> GetTopActiveUsersAsync(int count)
     {
         var today = DateTime.UtcNow.Date;
-        
+
         return await _securityContext.UserSessions
             .Where(s => s.CreatedAt >= today)
             .GroupBy(s => new { s.UserId, s.Username })
@@ -534,31 +579,3 @@ public class SessionManagementService
             .ToListAsync();
     }
 }
-
-/// <summary>
-/// Session statistics for dashboard
-/// </summary>
-public class SessionStatistics
-{
-    public int TotalActiveSessions { get; set; }
-    public int TotalSessionsToday { get; set; }
-    public int TotalSessionsYesterday { get; set; }
-    public int UniqueUsersToday { get; set; }
-    public int AdminTerminatedSessions { get; set; }
-    public TimeSpan AverageSessionDuration { get; set; }
-    public List<UserSessionSummary> TopActiveUsers { get; set; } = new();
-}
-
-/// <summary>
-/// User session summary
-/// </summary>
-public class UserSessionSummary
-{
-    public int? UserId { get; set; }
-    public string Username { get; set; } = string.Empty;
-    public int SessionCount { get; set; }
-    public DateTime LastActivity { get; set; }
-}
-
-
-

@@ -70,33 +70,20 @@ public class SessionController : ControllerBase
     }
 
     /// <summary>
-    /// Updates the heartbeat for the current user session
+    /// Updates the heartbeat for the current user session.
+    /// The middleware handles session initialization, so this just confirms validity.
     /// </summary>
     [HttpPost("heartbeat")]
     public async Task<IActionResult> Heartbeat()
     {
-        // This endpoint will trigger the SessionTrackingMiddleware
-        // which calls UpdateSessionActivityAsync.
-        // But we also need to ensure the session exists if it's the first call using OIDC.
-        
         var username = User.Identity?.Name;
         if (string.IsNullOrEmpty(username)) return Unauthorized();
 
-        // Ensure session exists
-        // Note: In OIDC, we may not have a traditional HttpContext.Session ID that persists across requests reliably
-        // depending on cookie config. 
-        // For Client Apps (DV_Web), we might want to pass a client-generated ID or rely on the principal.
+        // Session is already initialized/refreshed by SessionTrackingMiddleware.
+        // Just confirm the session is still valid.
+        var sessionKey = HttpContext.Session?.Id;
+        var isValid = await _sessionService.IsSessionValidAsync(sessionKey);
         
-        // This relies on the middleware to handle the actual update logic
-        // But creating the session if missing needs to be explicit.
-        
-        // Try to get UserId
-        var user = await _userService.GetUserByUsernameAsync(username);
-        if (user != null)
-        {
-             await _sessionService.InitializeSessionAsync(username, user.UserId, null);
-        }
-        
-        return Ok();
+        return isValid ? Ok() : Unauthorized();
     }
 }

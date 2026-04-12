@@ -1,11 +1,13 @@
 ﻿using DV.API.Data;
-using DV.API.Data;
 using DV.API.Services;
+using DV.Shared.DTOs;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats.Jpeg;
+using SixLabors.ImageSharp.Processing;
 using Microsoft.AspNetCore.Components.Authorization;
 using DV.Shared.Security;
 
@@ -20,17 +22,25 @@ namespace DV.API.Controllers;
 public class DocumentBlobController : ControllerBase
 {
     private readonly DocumentUploadService _documentUploadService;
+    private readonly DocumentRepository _repo;
+    private readonly NotificationService _notificationService;
     private readonly ILogger<DocumentBlobController> _logger;
     private readonly IDbContextFactory<SecurityDbContext> _securityDbContextFactory;
     private readonly AuthenticationStateProvider _authenticationStateProvider;
+    private readonly IMemoryCache _cache;
 
-    public DocumentBlobController(DocumentUploadService documentUploadService, ILogger<DocumentBlobController> logger,
-        IDbContextFactory<SecurityDbContext> securityDbContextFactory, AuthenticationStateProvider authenticationStateProvider)
+    public DocumentBlobController(DocumentUploadService documentUploadService, DocumentRepository repo, NotificationService notificationService,
+        ILogger<DocumentBlobController> logger,
+        IDbContextFactory<SecurityDbContext> securityDbContextFactory, AuthenticationStateProvider authenticationStateProvider,
+        IMemoryCache cache)
     {
         _documentUploadService = documentUploadService;
+        _repo = repo;
+        _notificationService = notificationService;
         _logger = logger;
         _securityDbContextFactory = securityDbContextFactory;
         _authenticationStateProvider = authenticationStateProvider;
+        _cache = cache;
     }
 
     /// <summary>
@@ -224,6 +234,167 @@ public class DocumentBlobController : ControllerBase
     }
 
     /// <summary>
+    /// Returns image metadata needed for tiled viewing (dimensions, tile size, levels)
+    /// </summary>
+    [HttpGet("page/{pageId:int}/image-info")]
+    public async Task<IActionResult> GetImageInfo(int pageId)
+    {
+        try
+        {
+            var cacheKey = $"imginfo_{pageId}";
+            if (_cache.TryGetValue(cacheKey, out object? cached))
+                return Ok(cached);
+
+            var content = await _documentUploadService.GetDocumentPageContentAsync(pageId);
+            if (content == null)
+                return NotFound("Document page not found");
+
+            var (fileContent, contentType, fileName) = content.Value;
+
+            // Check if this is an image we can identify
+            var isImage = contentType != null && (
+                contentType.Contains("image", StringComparison.OrdinalIgnoreCase) ||
+                contentType.Contains("tiff", StringComparison.OrdinalIgnoreCase));
+
+            if (!isImage)
+                return BadRequest("Not an image file");
+
+            using var stream = new MemoryStream(fileContent);
+            var imageInfo = Image.Identify(stream);
+
+            if (imageInfo == null)
+                return BadRequest("Could not identify image dimensions");
+
+            int tileSize = 256;
+            int maxDim = Math.Max(imageInfo.Width, imageInfo.Height);
+            int maxLevel = maxDim > 1 ? (int)Math.Ceiling(Math.Log2(maxDim)) : 0;
+
+            var result = new
+            {
+                width = imageInfo.Width,
+                height = imageInfo.Height,
+                tileSize = tileSize,
+                maxLevel = maxLevel,
+                format = contentType,
+                fileSize = fileContent.Length
+            };
+
+            _cache.Set(cacheKey, result, TimeSpan.FromHours(4));
+            return Ok(result);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error getting image info for page {PageId}", pageId);
+            return StatusCode(500, "Error retrieving image info");
+        }
+    }
+
+    /// <summary>
+    /// Serves a single tile from an image for progressive deep-zoom viewing.
+    /// Tiles are generated on-demand from the original BLOB and cached in memory.
+    /// </summary>
+    [HttpGet("page/{pageId:int}/tile/{level:int}/{col:int}/{row:int}")]
+    public async Task<IActionResult> GetTile(int pageId, int level, int col, int row)
+    {
+        try
+        {
+            int tileSize = 256;
+            var tileCacheKey = $"tile_{pageId}_{level}_{col}_{row}";
+
+            // Return cached tile if available
+            if (_cache.TryGetValue(tileCacheKey, out byte[]? cachedTile) && cachedTile != null)
+            {
+                Response.Headers["Cache-Control"] = "public, max-age=86400"; // 24h
+                return File(cachedTile, "image/jpeg");
+            }
+
+            // Get the original BLOB bytes (cached separately to avoid repeated DB hits)
+            var blobCacheKey = $"blob_{pageId}";
+            if (!_cache.TryGetValue(blobCacheKey, out (byte[] bytes, string contentType, string fileName) blob))
+            {
+                var content = await _documentUploadService.GetDocumentPageContentAsync(pageId);
+                if (content == null)
+                    return NotFound("Document page not found");
+
+                blob = content.Value;
+                _cache.Set(blobCacheKey, blob,
+                    new MemoryCacheEntryOptions { SlidingExpiration = TimeSpan.FromMinutes(5) });
+            }
+
+            // Decode image
+            using var inputStream = new MemoryStream(blob.bytes);
+            using var image = Image.Load(inputStream);
+
+            int imgWidth = image.Width;
+            int imgHeight = image.Height;
+            int maxDim = Math.Max(imgWidth, imgHeight);
+            int maxLevel = maxDim > 1 ? (int)Math.Ceiling(Math.Log2(maxDim)) : 0;
+
+            if (level > maxLevel || level < 0)
+                return NotFound("Invalid level");
+
+            // At this level, the scaled image dimensions
+            double scaleFactor = Math.Pow(2, level) / Math.Pow(2, maxLevel);
+            int levelWidth = Math.Max(1, (int)Math.Ceiling(imgWidth * scaleFactor));
+            int levelHeight = Math.Max(1, (int)Math.Ceiling(imgHeight * scaleFactor));
+
+            // Check tile bounds
+            int tilesX = (int)Math.Ceiling((double)levelWidth / tileSize);
+            int tilesY = (int)Math.Ceiling((double)levelHeight / tileSize);
+
+            if (col >= tilesX || row >= tilesY || col < 0 || row < 0)
+                return NotFound("Tile out of bounds");
+
+            // Calculate the region in the original image that this tile represents
+            double invScale = Math.Pow(2, maxLevel - level);
+            int srcX = (int)Math.Round(col * tileSize * invScale);
+            int srcY = (int)Math.Round(row * tileSize * invScale);
+            int srcW = (int)Math.Round(tileSize * invScale);
+            int srcH = (int)Math.Round(tileSize * invScale);
+
+            // Clamp to image bounds
+            srcX = Math.Min(srcX, imgWidth - 1);
+            srcY = Math.Min(srcY, imgHeight - 1);
+            srcW = Math.Min(srcW, imgWidth - srcX);
+            srcH = Math.Min(srcH, imgHeight - srcY);
+
+            if (srcW <= 0 || srcH <= 0)
+                return NotFound("Tile region empty");
+
+            // Output tile dimensions
+            int outW = Math.Min(tileSize, levelWidth - col * tileSize);
+            int outH = Math.Min(tileSize, levelHeight - row * tileSize);
+            outW = Math.Max(1, outW);
+            outH = Math.Max(1, outH);
+
+            // Crop and resize
+            using var tile = image.Clone(ctx =>
+            {
+                ctx.Crop(new Rectangle(srcX, srcY, srcW, srcH));
+                ctx.Resize(outW, outH);
+            });
+
+            using var outputStream = new MemoryStream();
+            tile.SaveAsJpeg(outputStream, new JpegEncoder { Quality = 85 });
+
+            var tileBytes = outputStream.ToArray();
+
+            // Cache tile for 1 hour
+            _cache.Set(tileCacheKey, tileBytes,
+                new MemoryCacheEntryOptions { SlidingExpiration = TimeSpan.FromHours(1) });
+
+            Response.Headers["Cache-Control"] = "public, max-age=86400";
+            return File(tileBytes, "image/jpeg");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error generating tile for page {PageId} level={Level} col={Col} row={Row}",
+                pageId, level, col, row);
+            return StatusCode(500, "Error generating tile");
+        }
+    }
+
+    /// <summary>
     /// Uploads a new document page with enhanced security validation
     /// </summary>
     /// <param name="documentId">Document ID</param>
@@ -246,6 +417,20 @@ public class DocumentBlobController : ControllerBase
                 return BadRequest("File is required");
             }
 
+            // Enforce project-level edit access
+            var document = await _repo.GetDocumentAsync("DefaultConnection", documentId);
+            if (document == null)
+            {
+                return NotFound("Document not found");
+            }
+
+            if (document.ProjectId.HasValue && !await _repo.HasProjectEditAccessAsync(User, document.ProjectId.Value))
+            {
+                _logger.LogWarning("User {User} denied edit access to project {ProjectId} for upload on document {DocumentId}",
+                    User.Identity?.Name, document.ProjectId, documentId);
+                return Forbid();
+            }
+
             // Resolve current user for auditing
             var currentUserId = await ResolveCurrentUserIdAsync();
             var documentPage = await _documentUploadService.UploadFileAsync(
@@ -253,6 +438,24 @@ public class DocumentBlobController : ControllerBase
 
             _logger.LogInformation("Successfully uploaded file {FileName} for Document {DocumentId}, Page {PageNumber}",
                 file.FileName, documentId, pageNumber);
+
+            // SI-5: Generate notification for document upload
+            try
+            {
+                await _notificationService.CreateNotificationAsync(new CreateNotificationDto
+                {
+                    UserId = currentUserId,
+                    Title = "Document Uploaded",
+                    Message = $"File '{file.FileName}' uploaded to Document {documentId}, Page {pageNumber}.",
+                    Category = NotificationCategories.DocumentUpload,
+                    SourceSystem = NotificationSources.Api,
+                    CorrelationId = $"doc-{documentId}-page-{pageNumber}"
+                });
+            }
+            catch (Exception notifEx)
+            {
+                _logger.LogWarning(notifEx, "Failed to create upload notification for Document {DocumentId}", documentId);
+            }
 
             return Ok(new
             {
