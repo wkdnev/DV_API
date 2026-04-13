@@ -126,8 +126,8 @@ public class BadFileReportController : ControllerBase
             {
                 UserId = user.UserId,
                 Username = username,
-                EventType = "BadFileReport",
-                Action = "Create",
+                EventType = AuditEventTypes.BadFileReport,
+                Action = AuditActions.CreateReport,
                 Details = $"Created bad file report #{reportId} in schema {request.SchemaName}",
                 IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
                 Timestamp = DateTime.UtcNow
@@ -187,8 +187,8 @@ public class BadFileReportController : ControllerBase
             {
                 UserId = user.UserId,
                 Username = username,
-                EventType = "BadFileReport",
-                Action = "Update",
+                EventType = AuditEventTypes.BadFileReport,
+                Action = AuditActions.UpdateReport,
                 Details = $"Updated bad file report #{id} in schema {schemaName} (Status: {request.Status})",
                 IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
                 Timestamp = DateTime.UtcNow

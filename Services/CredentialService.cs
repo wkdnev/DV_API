@@ -18,6 +18,7 @@ public class CredentialService : ICredentialService
 {
     private readonly SecurityDbContext _context;
     private readonly ILogger<CredentialService> _logger;
+    private readonly AuditService _auditService;
 
     // NIST AC-7 parameters
     private const int MaxFailedAttempts = 5;
@@ -30,10 +31,11 @@ public class CredentialService : ICredentialService
     private const int HashBytes = 64;
     private const string Algorithm = "PBKDF2-SHA512";
 
-    public CredentialService(SecurityDbContext context, ILogger<CredentialService> logger)
+    public CredentialService(SecurityDbContext context, ILogger<CredentialService> logger, AuditService auditService)
     {
         _context = context;
         _logger = logger;
+        _auditService = auditService;
     }
 
     public async Task<string?> CreateCredentialAsync(int userId, string password, string createdBy)
@@ -170,6 +172,11 @@ public class CredentialService : ICredentialService
 
         await _context.SaveChangesAsync();
 
+        // NIST AU-2: Audit password change
+        await _auditService.LogCredentialChangeAsync(
+            $"UserId:{userId}", userId, AuditActions.ChangePassword, AuditResults.Success,
+            details: "User changed their own password");
+
         _logger.LogInformation("Password changed by user {UserId}", userId);
         return null;
     }
@@ -199,6 +206,13 @@ public class CredentialService : ICredentialService
         await _context.SaveChangesAsync();
 
         _logger.LogInformation("Password reset by admin {Admin} for user {UserId}", adminUsername, userId);
+
+        // NIST AU-2: Audit admin password reset
+        await _auditService.LogCredentialChangeAsync(
+            adminUsername, null, AuditActions.AdminResetPassword, AuditResults.Success,
+            targetUsername: $"UserId:{userId}", targetUserId: userId,
+            details: $"Admin {adminUsername} reset password for user {userId}");
+
         return null;
     }
 

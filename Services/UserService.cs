@@ -15,12 +15,14 @@ public class UserService
     private readonly SecurityDbContext _context;
     private readonly ICacheService _cache;
     private readonly ILogger<UserService> _logger;
+    private readonly AuditService _auditService;
 
-    public UserService(SecurityDbContext context, ICacheService cache, ILogger<UserService> logger)
+    public UserService(SecurityDbContext context, ICacheService cache, ILogger<UserService> logger, AuditService auditService)
     {
         _context = context;
         _cache = cache;
         _logger = logger;
+        _auditService = auditService;
     }
 
     public async Task<ApplicationUser?> GetUserByUsernameAsync(string username)
@@ -150,6 +152,12 @@ public class UserService
 
         _context.Users.Remove(user);
         await _context.SaveChangesAsync();
+
+        // NIST AU-2: Audit user deletion
+        await _auditService.LogUserManagementAsync(
+            "System", null, AuditActions.DeleteUser,
+            user.Username, userId,
+            details: $"User {user.Username} (ID:{userId}) deleted");
     }
 
     private string NormalizeUsername(string username)
@@ -179,6 +187,12 @@ public class UserService
         {
             user.IsActive = false;
             await _context.SaveChangesAsync();
+
+            // NIST AU-2: Audit user deactivation
+            await _auditService.LogUserManagementAsync(
+                "System", null, AuditActions.DeactivateUser,
+                user.Username, userId,
+                details: $"User {user.Username} (ID:{userId}) deactivated");
         }
     }
 

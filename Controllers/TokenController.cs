@@ -22,15 +22,18 @@ public class TokenController : ControllerBase
     private readonly IConfiguration _configuration;
     private readonly ICredentialService _credentialService;
     private readonly UserService _userService;
+    private readonly AuditService _auditService;
 
     public TokenController(
         IConfiguration configuration,
         ICredentialService credentialService,
-        UserService userService)
+        UserService userService,
+        AuditService auditService)
     {
         _configuration = configuration;
         _credentialService = credentialService;
         _userService = userService;
+        _auditService = auditService;
     }
 
     /// <summary>
@@ -56,6 +59,10 @@ public class TokenController : ControllerBase
         var user = await _credentialService.ValidateCredentialAsync(request.Username, request.Password);
         if (user == null)
         {
+            // NIST AU-2: Log failed authentication attempt
+            await _auditService.LogAuthenticationAsync(
+                request.Username, AuditActions.LoginFailed, AuditResults.Failed,
+                "Invalid username or password via API token endpoint");
             return Unauthorized(new { error = "Invalid username or password" });
         }
 
@@ -111,6 +118,11 @@ public class TokenController : ControllerBase
         );
 
         var tokenString = new JwtSecurityTokenHandler().WriteToken(token);
+
+        // NIST AU-2: Log successful authentication
+        await _auditService.LogAuthenticationAsync(
+            user.Username, AuditActions.Login, AuditResults.Success,
+            "JWT token issued via API token endpoint");
 
         return Ok(new
         {
