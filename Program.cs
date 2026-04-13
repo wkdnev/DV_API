@@ -21,6 +21,7 @@ using Microsoft.IdentityModel.Tokens;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.Extensions.Options;
 using System.Security.Claims;
+using System.Text;
 using DV.Shared.Constants;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -90,12 +91,42 @@ builder.Services.AddDbContext<SecurityDbContext>(options =>
 // ============================================================================
 // Authentication Configuration
 // ============================================================================
+var authMode = builder.Configuration["Auth:Mode"] ?? "ADFS";
+var isInternalAuth = authMode.Equals("Internal", StringComparison.OrdinalIgnoreCase);
+
 if (builder.Environment.IsDevelopment())
 {
     // Development: bypass AD FS, auto-authenticate as dev user
     builder.Services.AddAuthentication("DevAuth")
         .AddScheme<AuthenticationSchemeOptions, DevAuthenticationHandler>("DevAuth", null);
     Console.WriteLine("*** DEVELOPMENT MODE: Authentication bypassed — auto-authenticating as AD\\neil.rainsforth ***");
+}
+else if (isInternalAuth)
+{
+    // Internal mode: validate JWTs signed with a local symmetric key
+    var signingKey = builder.Configuration["Jwt:SigningKey"] 
+        ?? throw new InvalidOperationException("Jwt:SigningKey must be configured for Internal auth mode");
+    var issuer = builder.Configuration["Jwt:Issuer"] ?? "DocViewer";
+    var audience = builder.Configuration["Jwt:Audience"] ?? "docviewer-api";
+
+    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(options =>
+        {
+            options.TokenValidationParameters = new TokenValidationParameters
+            {
+                ValidateIssuer = true,
+                ValidIssuer = issuer,
+                ValidateAudience = true,
+                ValidAudience = audience,
+                ValidateLifetime = true,
+                ValidateIssuerSigningKey = true,
+                IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(signingKey)),
+                ClockSkew = TimeSpan.FromMinutes(5),
+                RoleClaimType = "role",
+                NameClaimType = "unique_name"
+            };
+        });
+    Console.WriteLine("*** AUTH MODE: Internal — using local JWT token validation ***");
 }
 else
 {
@@ -121,6 +152,7 @@ else
                 NameClaimType = "unique_name"
             };
         });
+    Console.WriteLine("*** AUTH MODE: ADFS — using AD FS JWT Bearer validation ***");
 }
 
 // Authorization with GlobalAdmin support
