@@ -62,6 +62,19 @@ public class SessionManagementService : ISessionManagementService
                     await _securityContext.SaveChangesAsync();
                     await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.AbsoluteTimeout,
                         "Absolute Timeout", $"Session exceeded {SessionConfig.AbsoluteTimeoutHours}h maximum lifetime");
+
+                    // AU-12: Audit log for AC-12 absolute timeout enforcement
+                    await _auditService.LogEventAsync(new AuditLog
+                    {
+                        EventType = AuditEventTypes.SessionManagement,
+                        Action = AuditActions.AbsoluteTimeout,
+                        Username = username,
+                        UserId = existingSession.UserId,
+                        Result = AuditResults.Success,
+                        Details = $"Session exceeded {SessionConfig.AbsoluteTimeoutHours}h maximum lifetime",
+                        SessionId = sessionKey
+                    });
+
                     _logger.LogInformation("Session {SessionKey} terminated: absolute timeout for {Username}", sessionKey, username);
                     // Fall through to create a new session
                 }
@@ -74,6 +87,19 @@ public class SessionManagementService : ISessionManagementService
                             username, existingSession.IpAddress, ipAddress, existingSession.UserAgent != userAgent);
                         await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.AnomalyDetected,
                             "Session Anomaly", $"IP: {existingSession.IpAddress}->{ipAddress}");
+
+                        // AU-12: Audit log for session anomaly (SC-23)
+                        await _auditService.LogEventAsync(new AuditLog
+                        {
+                            EventType = AuditEventTypes.SecurityEvent,
+                            Action = AuditActions.AnomalyDetected,
+                            Username = username,
+                            UserId = existingSession.UserId,
+                            Result = AuditResults.Warning,
+                            Details = $"Session anomaly: IP {existingSession.IpAddress}->{ipAddress}, UA changed: {existingSession.UserAgent != userAgent}",
+                            IpAddress = ipAddress,
+                            SessionId = sessionKey
+                        });
                     }
 
                     // Sliding expiration: extend ExpiresAt on every activity
@@ -454,6 +480,20 @@ public class SessionManagementService : ISessionManagementService
 
                 await LogSessionActivityAsync(session.SessionId, reason,
                     "Session Expired", $"Cleanup: {reason}");
+
+                // AU-12: Audit log for session timeout enforcement
+                await _auditService.LogEventAsync(new AuditLog
+                {
+                    EventType = AuditEventTypes.SessionManagement,
+                    Action = reason == SessionActivityTypes.AbsoluteTimeout
+                        ? AuditActions.AbsoluteTimeout
+                        : AuditActions.IdleTimeout,
+                    Username = session.Username,
+                    UserId = session.UserId,
+                    Result = AuditResults.Success,
+                    Details = $"Session cleanup: {reason}",
+                    SessionId = session.SessionKey
+                });
             }
 
             if (expiredSessions.Count > 0)
@@ -501,6 +541,18 @@ public class SessionManagementService : ISessionManagementService
 
                 await LogSessionActivityAsync(oldSession.SessionId, SessionActivityTypes.ConcurrentSessionEviction,
                     "Evicted", $"Concurrent session limit ({SessionConfig.MaxConcurrentSessionsPerUser}) exceeded");
+
+                // AU-12: Audit log for AC-10 enforcement
+                await _auditService.LogEventAsync(new AuditLog
+                {
+                    EventType = AuditEventTypes.SessionManagement,
+                    Action = AuditActions.ConcurrentSessionEviction,
+                    Username = username,
+                    UserId = oldSession.UserId,
+                    Result = AuditResults.Success,
+                    Details = $"Session evicted: concurrent session limit ({SessionConfig.MaxConcurrentSessionsPerUser}) exceeded",
+                    SessionId = oldSession.SessionKey
+                });
             }
 
             await _securityContext.SaveChangesAsync();
