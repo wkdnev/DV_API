@@ -412,6 +412,20 @@ public class SessionManagementService : ISessionManagementService
         return await query.OrderByDescending(s => s.LastActivity).ToListAsync();
     }
 
+    public async Task<List<UserSession>> GetUserSessionsByUsernameAsync(string username, bool activeOnly = true)
+    {
+        var query = _securityContext.UserSessions.Where(s => s.Username == username);
+
+        if (activeOnly)
+        {
+            var now = DateTime.UtcNow;
+            var absoluteCutoff = now.AddHours(-SessionConfig.AbsoluteTimeoutHours);
+            query = query.Where(s => s.IsActive && s.ExpiresAt > now && s.CreatedAt > absoluteCutoff);
+        }
+
+        return await query.OrderByDescending(s => s.LastActivity).ToListAsync();
+    }
+
     public async Task<SessionStatistics> GetSessionStatisticsAsync()
     {
         var now = DateTime.UtcNow;
@@ -509,6 +523,153 @@ public class SessionManagementService : ISessionManagementService
             _logger.LogError(ex, "Error cleaning up expired sessions");
             return 0;
         }
+    }
+
+    // ========================================================================
+    // Delegated session management — called by UI apps via SessionController
+    // ========================================================================
+
+    /// <summary>
+    /// Initialize a session using an externally-provided session key.
+    /// Called by SessionController for delegated session management from UI apps.
+    /// </summary>
+    public async Task<UserSession> InitializeSessionWithKeyAsync(
+        string sessionKey, string username, int? userId,
+        string? ipAddress, string? userAgent, string? currentRole = null)
+    {
+        var now = DateTime.UtcNow;
+
+        var existingSession = await _securityContext.UserSessions
+            .FirstOrDefaultAsync(s => s.SessionKey == sessionKey && s.IsActive);
+
+        if (existingSession != null)
+        {
+            if ((now - existingSession.CreatedAt).TotalHours >= SessionConfig.AbsoluteTimeoutHours)
+            {
+                existingSession.IsActive = false;
+                existingSession.TerminatedAt = now;
+                await _securityContext.SaveChangesAsync();
+                await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.AbsoluteTimeout,
+                    "Absolute Timeout", $"Session exceeded {SessionConfig.AbsoluteTimeoutHours}h maximum lifetime");
+                await _auditService.LogEventAsync(new AuditLog
+                {
+                    EventType = AuditEventTypes.SessionManagement,
+                    Action = AuditActions.AbsoluteTimeout,
+                    Username = username,
+                    UserId = existingSession.UserId,
+                    Result = AuditResults.Success,
+                    Details = $"Session exceeded {SessionConfig.AbsoluteTimeoutHours}h maximum lifetime",
+                    SessionId = sessionKey
+                });
+            }
+            else
+            {
+                if (existingSession.IpAddress != ipAddress || existingSession.UserAgent != userAgent)
+                {
+                    _logger.LogWarning("Session anomaly for {Username}: IP {OldIp}->{NewIp}", username, existingSession.IpAddress, ipAddress);
+                    await LogSessionActivityAsync(existingSession.SessionId, SessionActivityTypes.AnomalyDetected,
+                        "Session Anomaly", $"IP: {existingSession.IpAddress}->{ipAddress}");
+                    await _auditService.LogEventAsync(new AuditLog
+                    {
+                        EventType = AuditEventTypes.SecurityEvent,
+                        Action = AuditActions.AnomalyDetected,
+                        Username = username,
+                        UserId = existingSession.UserId,
+                        Result = AuditResults.Warning,
+                        Details = $"Session anomaly: IP {existingSession.IpAddress}->{ipAddress}, UA changed: {existingSession.UserAgent != userAgent}",
+                        IpAddress = ipAddress,
+                        SessionId = sessionKey
+                    });
+                }
+
+                existingSession.LastActivity = now;
+                existingSession.ExpiresAt = now.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+                if (currentRole != null)
+                    existingSession.CurrentRole = currentRole;
+                await _securityContext.SaveChangesAsync();
+                return existingSession;
+            }
+        }
+
+        await EnforceConcurrentSessionLimitAsync(username, now);
+
+        var session = new UserSession
+        {
+            SessionKey = sessionKey,
+            UserId = userId,
+            Username = username,
+            IpAddress = ipAddress,
+            UserAgent = userAgent,
+            CurrentRole = currentRole,
+            CreatedAt = now,
+            LastActivity = now,
+            ExpiresAt = now.AddMinutes(SessionConfig.IdleTimeoutMinutes),
+            IsActive = true
+        };
+        _securityContext.UserSessions.Add(session);
+        await _securityContext.SaveChangesAsync();
+
+        await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.Login,
+            "Session Created", $"New session from {ipAddress}");
+        await _auditService.LogEventAsync(new AuditLog
+        {
+            EventType = AuditEventTypes.Authentication,
+            Action = AuditActions.SessionCreated,
+            Username = username,
+            UserId = userId,
+            Result = AuditResults.Success,
+            Details = $"New session created from {ipAddress}",
+            IpAddress = ipAddress,
+            SessionId = sessionKey
+        });
+
+        _logger.LogInformation("External session initialized for {Username} key {SessionKey}", username, sessionKey);
+        return session;
+    }
+
+    public async Task UpdateSessionActivityByKeyAsync(string sessionKey, string? activityType, string? action, string? resource)
+    {
+        var now = DateTime.UtcNow;
+        var session = await _securityContext.UserSessions
+            .FirstOrDefaultAsync(s => s.SessionKey == sessionKey && s.IsActive);
+        if (session == null) return;
+
+        var secondsSince = (now - session.LastActivity).TotalSeconds;
+        if (secondsSince < SessionConfig.ActivityThrottleSeconds && string.IsNullOrEmpty(activityType))
+            return;
+
+        session.LastActivity = now;
+        session.ExpiresAt = now.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+        await _securityContext.SaveChangesAsync();
+
+        if (!string.IsNullOrEmpty(activityType) && activityType != "Activity")
+            await LogSessionActivityAsync(session.SessionId, activityType, action, resource);
+    }
+
+    public async Task UpdateSessionRoleByKeyAsync(string sessionKey, string newRole)
+    {
+        var session = await _securityContext.UserSessions
+            .FirstOrDefaultAsync(s => s.SessionKey == sessionKey && s.IsActive);
+        if (session == null) return;
+
+        var oldRole = session.CurrentRole;
+        session.CurrentRole = newRole;
+        session.LastActivity = DateTime.UtcNow;
+        session.ExpiresAt = DateTime.UtcNow.AddMinutes(SessionConfig.IdleTimeoutMinutes);
+        await _securityContext.SaveChangesAsync();
+
+        await LogSessionActivityAsync(session.SessionId, SessionActivityTypes.RoleSwitch,
+            "Role Changed", $"'{oldRole}' -> '{newRole}'");
+        await _auditService.LogEventAsync(new AuditLog
+        {
+            EventType = AuditEventTypes.Authentication,
+            Action = AuditActions.RoleSwitch,
+            Username = session.Username,
+            UserId = session.UserId,
+            Result = AuditResults.Success,
+            Details = $"Role changed from '{oldRole}' to '{newRole}'",
+            SessionId = sessionKey
+        });
     }
 
     // ========================================================================
